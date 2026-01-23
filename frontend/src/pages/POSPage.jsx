@@ -525,6 +525,7 @@ export default function POSPage() {
         <DialogContent className="max-w-sm mx-4">
           <DialogHeader>
             <DialogTitle>M-Pesa Payment</DialogTitle>
+            <DialogDescription className="sr-only">Confirm M-Pesa STK Push payment</DialogDescription>
           </DialogHeader>
           <div className="py-6 text-center">
             <div className="w-16 h-16 mx-auto mb-4 bg-emerald-100 rounded-full flex items-center justify-center">
