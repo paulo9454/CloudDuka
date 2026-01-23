@@ -1,0 +1,114 @@
+{
+  "identity": {
+    "name": "CloudDuka",
+    "tagline": "Your Retail POS in the Cloud",
+    "tone": "Reliable, Fast, Accessible, Friendly",
+    "archetype": "Soft Utility",
+    "target_audience": "Retail shop owners and shopkeepers in Kenya"
+  },
+  "typography": {
+    "font_family": {
+      "headings": "Outfit, sans-serif",
+      "body": "Public Sans, sans-serif",
+      "mono": "JetBrains Mono, monospace"
+    },
+    "google_fonts_url": "https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=Public+Sans:wght@300;400;500;600&display=swap",
+    "scale": {
+      "h1": "text-3xl font-bold tracking-tight",
+      "h2": "text-2xl font-semibold tracking-tight",
+      "h3": "text-xl font-semibold",
+      "body": "text-base leading-relaxed",
+      "small": "text-sm text-muted-foreground",
+      "tiny": "text-xs font-medium uppercase tracking-wider"
+    }
+  },
+  "colors": {
+    "primary": {
+      "DEFAULT": "#007BFF",
+      "foreground": "#FFFFFF",
+      "hover": "#0069D9",
+      "active": "#0056B3"
+    },
+    "secondary": {
+      "DEFAULT": "#FF8C00",
+      "foreground": "#FFFFFF",
+      "hover": "#E07B00"
+    },
+    "background": {
+      "light": "#F8FAFC",
+      "dark": "#0F172A",
+      "paper_light": "#FFFFFF",
+      "paper_dark": "#1E293B"
+    },
+    "status": {
+      "success": "#10B981",
+      "warning": "#F59E0B",
+      "error": "#EF4444",
+      "info": "#3B82F6"
+    },
+    "border": {
+      "light": "#E2E8F0",
+      "dark": "#334155"
+    }
+  },
+  "visual_enhancers": {
+    "radius": "rounded-xl",
+    "shadows": {
+      "card": "shadow-sm hover:shadow-md transition-shadow duration-200",
+      "floating": "shadow-lg shadow-blue-900/5"
+    },
+    "borders": "border border-slate-200 dark:border-slate-800",
+    "glass": "bg-white/80 dark:bg-slate-900/80 backdrop-blur-md border-b border-slate-200/50"
+  },
+  "layout": {
+    "container": "max-w-md mx-auto md:max-w-2xl lg:max-w-4xl xl:max-w-6xl px-4 md:px-6",
+    "section_spacing": "py-6 md:py-10",
+    "grid_dashboard": "grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4",
+    "mobile_nav_height": "h-16"
+  },
+  "components": {
+    "buttons": {
+      "primary": "bg-primary text-primary-foreground hover:bg-primary/90 h-12 px-6 rounded-full font-medium shadow-sm active:scale-95 transition-transform",
+      "secondary": "bg-secondary text-secondary-foreground hover:bg-secondary/90 h-12 px-6 rounded-full font-medium shadow-sm",
+      "outline": "border-2 border-slate-200 bg-transparent hover:bg-slate-50 text-slate-900 h-12 px-6 rounded-full font-medium",
+      "ghost": "hover:bg-slate-100 text-slate-700 h-10 px-4 rounded-lg"
+    },
+    "cards": {
+      "base": "bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 shadow-sm p-5",
+      "interactive": "cursor-pointer hover:border-primary/50 transition-colors"
+    },
+    "inputs": {
+      "base": "h-12 bg-slate-50 dark:bg-slate-950 border-slate-200 dark:border-slate-800 focus:ring-2 focus:ring-primary/20 rounded-lg px-4 text-base"
+    }
+  },
+  "assets": {
+    "logo_url": "https://customer-assets.emergentagent.com/job_983fa6fb-7b7a-442c-bfdf-c5926d9538b8/artifacts/uzuoo21v_CloudDuka%20Logo.jpeg",
+    "images": {
+      "shop_owner": "https://images.pexels.com/photos/5934224/pexels-photo-5934224.jpeg",
+      "grocery_shelves": "https://images.unsplash.com/photo-1633949970272-3421a17b5e32?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NTY2Njl8MHwxfHNlYXJjaHwyfHxncm9jZXJ5JTIwc3RvcmUlMjBzaGVsdmVzJTIwbmVhdHxlbnwwfHx8fDE3NjkyMTAyNjd8MA&ixlib=rb-4.1.0&q=85",
+      "mpesa_logo": "https://upload.wikimedia.org/wikipedia/commons/thumb/1/15/M-PESA_LOGO-01.svg/2560px-M-PESA_LOGO-01.svg.png"
+    },
+    "icons": "Use lucide-react for all icons. Examples: LayoutDashboard, ShoppingCart, Package, Users, Settings, LogOut, Plus, Minus, Trash2, Search, ChevronRight"
+  },
+  "instructions_to_main_agent": [
+    "MOBILE FIRST: Always design for 360px width first. Use 'w-full' and 'flex-col' by default.",
+    "TOUCH TARGETS: Ensure all clickable elements are at least 44px height/width.",
+    "BOTTOM NAV: Implement a fixed bottom navigation bar for mobile users (Dashboard, POS, Products, More).",
+    "OFFLINE INDICATOR: Add a visual indicator when the app is offline (use navigator.onLine).",
+    "DATA-TESTID: Add 'data-testid' to all interactive elements (buttons, inputs, links). Format: 'page-section-element'.",
+    "SHADCN: Use Shadcn UI components but override styles to match the 'Soft Utility' aesthetic (more rounded, softer borders).",
+    "CHARTS: Use 'recharts' for the dashboard. Keep them simple (BarChart, AreaChart). Avoid PieCharts on mobile.",
+    "FORMS: Use 'react-hook-form' with 'zod' validation.",
+    "NOTIFICATIONS: Use 'sonner' for toast notifications.",
+    "THEME: Default to Light Mode. Use 'slate-50' for app background to avoid harsh white.",
+    "ROUTING: Use 'react-router-dom'.",
+    "STATE: Use 'zustand' for global state (cart, user session)."
+  ],
+  "universal_guidelines": [
+    "Avoid generic centered layouts. Use left alignment for text.",
+    "Use 2-3x more spacing than typical designs (p-4 becomes p-6 or p-8).",
+    "Never use pure black (#000000). Use slate-900 or slate-950.",
+    "Add micro-interactions: hover states, active states, focus rings.",
+    "Use skeleton loaders instead of spinners for data fetching."
+  ]
+}
