@@ -1,0 +1,122 @@
+{
+  "timestamp": "2026-01-23T23:31:46.872431",
+  "total_tests": 19,
+  "passed_tests": 18,
+  "success_rate": 94.73684210526315,
+  "results": [
+    {
+      "test": "Health Check",
+      "success": true,
+      "message": "",
+      "response_data": null
+    },
+    {
+      "test": "User Registration",
+      "success": true,
+      "message": "",
+      "response_data": null
+    },
+    {
+      "test": "User Login (Invalid)",
+      "success": false,
+      "message": "Login should have failed with wrong credentials",
+      "response_data": null
+    },
+    {
+      "test": "Get User Profile",
+      "success": true,
+      "message": "",
+      "response_data": null
+    },
+    {
+      "test": "Create Product",
+      "success": true,
+      "message": "",
+      "response_data": null
+    },
+    {
+      "test": "List Products",
+      "success": true,
+      "message": "Found 1 products",
+      "response_data": null
+    },
+    {
+      "test": "Update Product",
+      "success": true,
+      "message": "",
+      "response_data": null
+    },
+    {
+      "test": "Create Credit Customer",
+      "success": true,
+      "message": "",
+      "response_data": null
+    },
+    {
+      "test": "List Credit Customers",
+      "success": true,
+      "message": "Found 1 customers",
+      "response_data": null
+    },
+    {
+      "test": "Create Cash Sale",
+      "success": true,
+      "message": "",
+      "response_data": null
+    },
+    {
+      "test": "Create Credit Sale",
+      "success": true,
+      "message": "",
+      "response_data": null
+    },
+    {
+      "test": "M-Pesa STK Push",
+      "success": true,
+      "message": "",
+      "response_data": null
+    },
+    {
+      "test": "M-Pesa Confirmation",
+      "success": true,
+      "message": "",
+      "response_data": null
+    },
+    {
+      "test": "Log Damaged Stock",
+      "success": true,
+      "message": "",
+      "response_data": null
+    },
+    {
+      "test": "Dashboard Stats",
+      "success": true,
+      "message": "",
+      "response_data": null
+    },
+    {
+      "test": "Sales Report",
+      "success": true,
+      "message": "",
+      "response_data": null
+    },
+    {
+      "test": "Credit Report",
+      "success": true,
+      "message": "",
+      "response_data": null
+    },
+    {
+      "test": "Get Shop Settings",
+      "success": true,
+      "message": "",
+      "response_data": null
+    },
+    {
+      "test": "Update Shop Settings",
+      "success": true,
+      "message": "",
+      "response_data": null
+    }
+  ]
+}
