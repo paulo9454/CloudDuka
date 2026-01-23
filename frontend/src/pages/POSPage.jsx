@@ -391,6 +391,7 @@ export default function POSPage() {
         <DialogContent className="max-w-md mx-4">
           <DialogHeader>
             <DialogTitle className="text-xl">Select Payment Method</DialogTitle>
+            <DialogDescription className="sr-only">Choose how you want to complete this sale</DialogDescription>
           </DialogHeader>
           
           <div className="space-y-4 py-4">
