@@ -530,9 +530,14 @@ class CloudDukaPOSAPITester:
         self.test_get_user_profile()
         
         # Product management tests
+        self.test_create_category()
+        self.test_list_categories()
+        self.test_update_category()
         self.test_create_product()
         self.test_list_products()
         self.test_update_product()
+        self.test_get_category_products()
+        self.test_get_other_category_products()
         
         # Customer management tests
         self.test_create_credit_customer()
