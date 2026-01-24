@@ -72,7 +72,12 @@ class ProductCreate(BaseModel):
     cost_price: Optional[float] = None
     stock_quantity: int = 0
     min_stock_level: int = 5
-    unit: str = "piece"  # piece, kg, liter, etc.
+    unit: str = "piece"
+    # Bundle pricing fields
+    sell_by: str = "unit"  # "unit" or "bundle"
+    bundle_units: Optional[int] = None  # e.g., 3 units per bundle
+    bundle_price: Optional[float] = None  # e.g., 10 KES for bundle
+    bundle_only: bool = False  # If true, only sell in full bundles
 
 class ProductUpdate(BaseModel):
     name: Optional[str] = None
@@ -83,6 +88,10 @@ class ProductUpdate(BaseModel):
     stock_quantity: Optional[int] = None
     min_stock_level: Optional[int] = None
     unit: Optional[str] = None
+    sell_by: Optional[str] = None
+    bundle_units: Optional[int] = None
+    bundle_price: Optional[float] = None
+    bundle_only: Optional[bool] = None
 
 class ProductResponse(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -95,6 +104,10 @@ class ProductResponse(BaseModel):
     stock_quantity: int
     min_stock_level: int
     unit: str
+    sell_by: str = "unit"
+    bundle_units: Optional[int] = None
+    bundle_price: Optional[float] = None
+    bundle_only: bool = False
     shop_id: str
     created_at: str
     updated_at: str
