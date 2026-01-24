@@ -1,8 +1,8 @@
 {
-  "timestamp": "2026-01-24T00:27:24.951620",
+  "timestamp": "2026-01-24T00:27:53.131761",
   "total_tests": 26,
-  "passed_tests": 24,
-  "success_rate": 92.3076923076923,
+  "passed_tests": 25,
+  "success_rate": 96.15384615384616,
   "results": [
     {
       "test": "Health Check",
@@ -18,8 +18,8 @@
     },
     {
       "test": "User Login (Invalid)",
-      "success": true,
-      "message": "Correctly rejected invalid credentials",
+      "success": false,
+      "message": "Login should have failed with wrong credentials",
       "response_data": null
     },
     {
@@ -36,8 +36,8 @@
     },
     {
       "test": "List Categories",
-      "success": false,
-      "message": "Missing 'Other' category",
+      "success": true,
+      "message": "Found 1 categories including test category",
       "response_data": null
     },
     {
@@ -156,8 +156,8 @@
     },
     {
       "test": "Verify Category Deleted",
-      "success": false,
-      "message": "Category still exists after deletion",
+      "success": true,
+      "message": "",
       "response_data": null
     }
   ]
