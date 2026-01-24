@@ -16,10 +16,12 @@ import {
   Wallet, 
   Smartphone, 
   CreditCard,
-  X,
   Check,
   Loader2,
-  Package
+  Package,
+  FolderOpen,
+  ChevronLeft,
+  Grid3X3
 } from 'lucide-react';
 
 export default function POSPage() {
@@ -31,7 +33,8 @@ export default function POSPage() {
   const [categories, setCategories] = useState([]);
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
-  const [selectedCategory, setSelectedCategory] = useState('all');
+  const [selectedCategory, setSelectedCategory] = useState(null); // null = show categories, string = show products
+  const [viewMode, setViewMode] = useState('categories'); // 'categories' or 'products'
   
   // Payment modal state
   const [showPayment, setShowPayment] = useState(false);
@@ -66,7 +69,7 @@ export default function POSPage() {
 
   const loadCategories = async () => {
     try {
-      const data = await api.get('/products/categories/list');
+      const data = await api.get('/categories');
       setCategories(data);
     } catch (error) {
       console.error('Failed to load categories');
@@ -82,15 +85,50 @@ export default function POSPage() {
     }
   };
 
+  // Filter products by selected category
   const filteredProducts = useMemo(() => {
-    return products.filter((p) => {
-      const matchesSearch = !searchQuery || 
+    let filtered = products;
+    
+    // Filter by category
+    if (selectedCategory) {
+      if (selectedCategory === 'other') {
+        filtered = products.filter(p => !p.category || p.category === '');
+      } else {
+        filtered = products.filter(p => p.category === selectedCategory);
+      }
+    }
+    
+    // Filter by search
+    if (searchQuery) {
+      filtered = filtered.filter(p => 
         p.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        (p.sku && p.sku.toLowerCase().includes(searchQuery.toLowerCase()));
-      const matchesCategory = selectedCategory === 'all' || p.category === selectedCategory;
-      return matchesSearch && matchesCategory;
-    });
-  }, [products, searchQuery, selectedCategory]);
+        (p.sku && p.sku.toLowerCase().includes(searchQuery.toLowerCase()))
+      );
+    }
+    
+    return filtered;
+  }, [products, selectedCategory, searchQuery]);
+
+  const handleSelectCategory = (categoryName) => {
+    if (categoryName === 'Other') {
+      setSelectedCategory('other');
+    } else {
+      setSelectedCategory(categoryName);
+    }
+    setViewMode('products');
+    setSearchQuery('');
+  };
+
+  const handleBackToCategories = () => {
+    setSelectedCategory(null);
+    setViewMode('categories');
+    setSearchQuery('');
+  };
+
+  const handleShowAllProducts = () => {
+    setSelectedCategory(null);
+    setViewMode('products');
+  };
 
   const handleAddToCart = (product) => {
     if (product.stock_quantity <= 0) {
@@ -159,7 +197,6 @@ export default function POSPage() {
       };
 
       if (!isOnline) {
-        // Save to offline queue
         addPendingSale(saleData);
         toast.success('Sale saved offline. Will sync when online.');
         clearCart();
@@ -170,7 +207,6 @@ export default function POSPage() {
       const sale = await api.post('/sales', saleData);
       
       if (paymentMethod === 'mpesa') {
-        // Initiate M-Pesa STK Push
         const mpesaRes = await api.post('/mpesa/stk-push', {
           phone: customerPhone,
           amount: total,
@@ -186,7 +222,7 @@ export default function POSPage() {
         });
         clearCart();
         setShowPayment(false);
-        loadProducts(); // Refresh stock
+        loadProducts();
       }
     } catch (error) {
       toast.error(error.message || 'Failed to process sale');
@@ -215,48 +251,70 @@ export default function POSPage() {
 
   return (
     <div className="flex flex-col h-full" data-testid="pos-page">
-      {/* Search Header */}
+      {/* Header */}
       <div className="p-4 bg-white border-b sticky top-0 z-10">
+        {viewMode === 'products' && selectedCategory && (
+          <div className="flex items-center gap-2 mb-3">
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={handleBackToCategories}
+              className="pl-1"
+              data-testid="back-to-categories-btn"
+            >
+              <ChevronLeft className="h-5 w-5 mr-1" />
+              Categories
+            </Button>
+            <span className="text-lg font-semibold" style={{ fontFamily: 'Outfit, sans-serif' }}>
+              {selectedCategory === 'other' ? 'Other' : selectedCategory}
+            </span>
+          </div>
+        )}
+        
         <div className="relative">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-5 w-5 text-slate-400" />
           <Input
-            placeholder="Search products..."
+            placeholder={viewMode === 'categories' ? "Search all products..." : "Search in category..."}
             value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
+            onChange={(e) => {
+              setSearchQuery(e.target.value);
+              if (e.target.value && viewMode === 'categories') {
+                setViewMode('products');
+                setSelectedCategory(null);
+              }
+            }}
             className="pl-10 h-12 bg-slate-50"
             data-testid="pos-search-input"
           />
         </div>
         
-        {/* Categories */}
-        {categories.length > 0 && (
-          <div className="flex gap-2 mt-3 overflow-x-auto pb-2">
+        {/* View Toggle */}
+        {viewMode === 'products' && !selectedCategory && (
+          <div className="flex gap-2 mt-3">
             <Button
-              variant={selectedCategory === 'all' ? 'default' : 'outline'}
+              variant="outline"
               size="sm"
-              className={`rounded-full whitespace-nowrap ${selectedCategory === 'all' ? 'bg-[#007BFF]' : ''}`}
-              onClick={() => setSelectedCategory('all')}
-              data-testid="category-all-btn"
+              onClick={handleBackToCategories}
+              className="flex-1"
+              data-testid="view-categories-btn"
             >
-              All
+              <FolderOpen className="h-4 w-4 mr-1" />
+              View Categories
             </Button>
-            {categories.map((cat) => (
-              <Button
-                key={cat}
-                variant={selectedCategory === cat ? 'default' : 'outline'}
-                size="sm"
-                className={`rounded-full whitespace-nowrap ${selectedCategory === cat ? 'bg-[#007BFF]' : ''}`}
-                onClick={() => setSelectedCategory(cat)}
-                data-testid={`category-${cat}-btn`}
-              >
-                {cat}
-              </Button>
-            ))}
+            <Button
+              variant="default"
+              size="sm"
+              className="flex-1 bg-[#007BFF]"
+              data-testid="view-all-btn"
+            >
+              <Grid3X3 className="h-4 w-4 mr-1" />
+              All Products
+            </Button>
           </div>
         )}
       </div>
 
-      {/* Products Grid */}
+      {/* Content Area */}
       <div className="flex-1 overflow-y-auto p-4 pb-40">
         {loading ? (
           <div className="grid grid-cols-2 gap-3">
@@ -264,13 +322,92 @@ export default function POSPage() {
               <Skeleton key={i} className="h-32 rounded-xl" />
             ))}
           </div>
+        ) : viewMode === 'categories' && !searchQuery ? (
+          /* Categories Grid */
+          <div className="space-y-4">
+            <div className="flex items-center justify-between">
+              <h2 className="text-lg font-semibold" style={{ fontFamily: 'Outfit, sans-serif' }}>
+                Select Category
+              </h2>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={handleShowAllProducts}
+                data-testid="show-all-products-btn"
+              >
+                Show All
+              </Button>
+            </div>
+            
+            {categories.length === 0 ? (
+              <div className="text-center py-8 text-slate-500">
+                <FolderOpen className="h-12 w-12 mx-auto mb-2 opacity-30" />
+                <p>No categories yet</p>
+                <Button 
+                  variant="outline"
+                  className="mt-3"
+                  onClick={handleShowAllProducts}
+                >
+                  View All Products
+                </Button>
+              </div>
+            ) : (
+              <div className="grid grid-cols-2 gap-3">
+                {categories.map((category) => (
+                  <Card
+                    key={category.id}
+                    className="cursor-pointer transition-all active:scale-95 hover:border-slate-300 overflow-hidden"
+                    onClick={() => handleSelectCategory(category.name)}
+                    data-testid={`pos-category-${category.id}`}
+                  >
+                    <div 
+                      className="h-2" 
+                      style={{ backgroundColor: category.color }}
+                    />
+                    <CardContent className="p-4">
+                      <div className="flex items-center gap-3">
+                        <div 
+                          className="p-2 rounded-lg"
+                          style={{ backgroundColor: `${category.color}20` }}
+                        >
+                          <FolderOpen 
+                            className="h-6 w-6" 
+                            style={{ color: category.color }}
+                          />
+                        </div>
+                        <div>
+                          <h3 className="font-semibold">{category.name}</h3>
+                          <p className="text-sm text-slate-500">
+                            {category.product_count} item{category.product_count !== 1 ? 's' : ''}
+                          </p>
+                        </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+                ))}
+              </div>
+            )}
+          </div>
         ) : filteredProducts.length === 0 ? (
+          /* No Products Found */
           <div className="text-center py-12 text-slate-500">
             <Package className="h-16 w-16 mx-auto mb-4 opacity-30" />
             <p className="font-medium">No products found</p>
-            <p className="text-sm mt-1">Try a different search or category</p>
+            <p className="text-sm mt-1">
+              {searchQuery ? 'Try a different search' : 'Add products to this category'}
+            </p>
+            {selectedCategory && (
+              <Button
+                variant="outline"
+                className="mt-4"
+                onClick={handleBackToCategories}
+              >
+                Back to Categories
+              </Button>
+            )}
           </div>
         ) : (
+          /* Products Grid */
           <div className="grid grid-cols-2 gap-3">
             {filteredProducts.map((product) => (
               <Card 
