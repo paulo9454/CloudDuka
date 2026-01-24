@@ -20,6 +20,7 @@ class CloudDukaPOSAPITester:
         self.test_product_id = None
         self.test_customer_id = None
         self.test_sale_id = None
+        self.test_category_id = None
 
     def log_result(self, test_name: str, success: bool, message: str = "", response_data: Any = None):
         """Log test result"""
