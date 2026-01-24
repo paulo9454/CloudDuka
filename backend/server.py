@@ -193,6 +193,26 @@ class MpesaSTKResponse(BaseModel):
     response_description: str
     customer_message: str
 
+class CategoryCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    color: Optional[str] = None  # For UI display
+
+class CategoryUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    color: Optional[str] = None
+
+class CategoryResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str
+    name: str
+    description: Optional[str] = None
+    color: Optional[str] = None
+    product_count: int = 0
+    shop_id: str
+    created_at: str
+
 # =============================================================================
 # HELPER FUNCTIONS
 # =============================================================================
