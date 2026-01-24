@@ -89,3 +89,31 @@ CloudDuka is a cloud-based, mobile-first POS system designed for retail shops in
 2. Implement Stripe/PayPal for subscription payments
 3. Add IndexedDB for robust offline support
 4. Implement receipt thermal printer support
+
+---
+
+## Update: January 2024 - Category Management Feature
+
+### Implemented
+- [x] Category CRUD for Owners (Create, Read, Update, Delete)
+- [x] Category assignment for products via dropdown
+- [x] Category filter chips on Products page
+- [x] Category-first selection in POS for faster product finding
+- [x] "Other" category for uncategorized products
+- [x] Color-coded category badges on products
+- [x] Back to categories navigation in POS
+- [x] "Show All" option to view all products
+
+### API Endpoints Added
+- `POST /api/categories` - Create category (Owner only)
+- `GET /api/categories` - List all categories with product counts
+- `GET /api/categories/{id}` - Get single category
+- `PUT /api/categories/{id}` - Update category (Owner only)  
+- `DELETE /api/categories/{id}` - Delete category (Owner only)
+- `GET /api/categories/{id}/products` - Get products in category
+
+### Workflow
+1. Owner creates categories (Cigarettes, Snacks, Beverages, Household, etc.)
+2. Owner/Shopkeeper assigns products to categories when adding/editing
+3. Shopkeeper selects category first in POS → sees only products in that category
+4. Faster checkout, less scrolling, organized inventory
