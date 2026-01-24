@@ -242,7 +242,7 @@ class CloudDukaPOSAPITester:
         """Test creating a product"""
         product_data = {
             "name": "Test Milk 500ml",
-            "category": "Dairy",
+            "category": "Updated Test Beverages",  # Use our test category
             "unit_price": 50.0,
             "cost_price": 40.0,
             "stock_quantity": 100,
