@@ -131,6 +131,113 @@ class CloudDukaPOSAPITester:
         
         return success
 
+    def test_create_category(self):
+        """Test creating a category (Owner only)"""
+        category_data = {
+            "name": "Test Beverages",
+            "description": "Test category for drinks",
+            "color": "#007BFF"
+        }
+        
+        success, data = self.make_request('POST', 'categories', category_data, 200)
+        
+        if success and 'id' in data:
+            self.test_category_id = data['id']
+            self.log_result("Create Category", True)
+        else:
+            self.log_result("Create Category", False, f"Category creation failed: {data}")
+        
+        return success
+
+    def test_list_categories(self):
+        """Test listing categories with product counts"""
+        success, data = self.make_request('GET', 'categories')
+        
+        if success and isinstance(data, list):
+            # Should include "Other" category and our test category
+            category_names = [cat['name'] for cat in data]
+            has_other = 'Other' in category_names
+            has_test_category = 'Test Beverages' in category_names
+            
+            if has_other:
+                self.log_result("List Categories", True, f"Found {len(data)} categories including 'Other'")
+            else:
+                self.log_result("List Categories", False, "Missing 'Other' category")
+                return False
+        else:
+            self.log_result("List Categories", False, f"Category listing failed: {data}")
+            return False
+        
+        return success
+
+    def test_update_category(self):
+        """Test updating a category (Owner only)"""
+        if not self.test_category_id:
+            self.log_result("Update Category", False, "No category ID available")
+            return False
+            
+        update_data = {
+            "name": "Updated Test Beverages",
+            "description": "Updated description",
+            "color": "#FF8C00"
+        }
+        
+        success, data = self.make_request('PUT', f'categories/{self.test_category_id}', update_data)
+        
+        if success and data.get('name') == 'Updated Test Beverages':
+            self.log_result("Update Category", True)
+        else:
+            self.log_result("Update Category", False, f"Category update failed: {data}")
+        
+        return success
+
+    def test_get_category_products(self):
+        """Test getting products in a category"""
+        if not self.test_category_id:
+            self.log_result("Get Category Products", False, "No category ID available")
+            return False
+            
+        success, data = self.make_request('GET', f'categories/{self.test_category_id}/products')
+        
+        if success and isinstance(data, list):
+            self.log_result("Get Category Products", True, f"Found {len(data)} products in category")
+        else:
+            self.log_result("Get Category Products", False, f"Get category products failed: {data}")
+        
+        return success
+
+    def test_get_other_category_products(self):
+        """Test getting products in 'Other' category"""
+        success, data = self.make_request('GET', 'categories/other/products')
+        
+        if success and isinstance(data, list):
+            self.log_result("Get Other Category Products", True, f"Found {len(data)} uncategorized products")
+        else:
+            self.log_result("Get Other Category Products", False, f"Get other category products failed: {data}")
+        
+        return success
+
+    def test_delete_category(self):
+        """Test deleting a category (Owner only) - should make products uncategorized"""
+        if not self.test_category_id:
+            self.log_result("Delete Category", False, "No category ID available")
+            return False
+            
+        success, data = self.make_request('DELETE', f'categories/{self.test_category_id}', expected_status=200)
+        
+        if success:
+            self.log_result("Delete Category", True)
+            # Verify category is gone
+            get_success, get_data = self.make_request('GET', f'categories/{self.test_category_id}', expected_status=404)
+            if not get_success:  # Should fail with 404
+                self.log_result("Verify Category Deleted", True)
+            else:
+                self.log_result("Verify Category Deleted", False, "Category still exists after deletion")
+        else:
+            self.log_result("Delete Category", False, f"Category deletion failed: {data}")
+        
+        return success
+
     def test_create_product(self):
         """Test creating a product"""
         product_data = {
