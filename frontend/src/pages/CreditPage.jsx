@@ -1,10 +1,11 @@
 import React, { useState, useEffect } from 'react';
-import { useAuthStore, api, formatCurrency, formatDate } from '../lib/store';
+import { useAuthStore, api, formatCurrency, formatDate, formatDateTime } from '../lib/store';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
 import { Button } from '../components/ui/button';
 import { Input } from '../components/ui/input';
 import { Label } from '../components/ui/label';
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '../components/ui/dialog';
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '../components/ui/dialog';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '../components/ui/tabs';
 import { Skeleton } from '../components/ui/skeleton';
 import { toast } from 'sonner';
 import { 
@@ -14,11 +15,16 @@ import {
   Phone, 
   CreditCard,
   DollarSign,
-  ChevronRight,
   Loader2,
   Check,
   History,
-  X
+  TrendingUp,
+  TrendingDown,
+  AlertCircle,
+  Mail,
+  MapPin,
+  Eye,
+  Receipt
 } from 'lucide-react';
 
 export default function CreditPage() {
@@ -26,11 +32,12 @@ export default function CreditPage() {
   const [customers, setCustomers] = useState([]);
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
+  const [activeTab, setActiveTab] = useState('all'); // all, with-balance
   
   // Modal states
   const [showAddModal, setShowAddModal] = useState(false);
   const [showPaymentModal, setShowPaymentModal] = useState(false);
-  const [showHistoryModal, setShowHistoryModal] = useState(false);
+  const [showDetailsModal, setShowDetailsModal] = useState(false);
   const [selectedCustomer, setSelectedCustomer] = useState(null);
   const [saving, setSaving] = useState(false);
   
@@ -56,11 +63,13 @@ export default function CreditPage() {
   }, []);
 
   const loadCustomers = async () => {
+    setLoading(true);
     try {
       const data = await api.get('/credit-customers');
       setCustomers(data);
     } catch (error) {
-      toast.error('Failed to load customers');
+      toast.error('Failed to load credit customers');
+      console.error('Load customers error:', error);
     } finally {
       setLoading(false);
     }
@@ -70,33 +79,43 @@ export default function CreditPage() {
     const matchesSearch = !searchQuery || 
       c.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
       c.phone.includes(searchQuery);
-    return matchesSearch;
+    const matchesTab = activeTab === 'all' || (activeTab === 'with-balance' && c.current_balance > 0);
+    return matchesSearch && matchesTab;
   });
 
   const totalOutstanding = customers.reduce((sum, c) => sum + c.current_balance, 0);
   const customersWithBalance = customers.filter((c) => c.current_balance > 0).length;
+  const totalCreditLimit = customers.reduce((sum, c) => sum + c.credit_limit, 0);
 
   const handleAddCustomer = async () => {
-    if (!formData.name || !formData.phone) {
-      toast.error('Name and phone are required');
+    if (!formData.name.trim()) {
+      toast.error('Customer name is required');
+      return;
+    }
+    if (!formData.phone.trim()) {
+      toast.error('Phone number is required');
       return;
     }
 
     setSaving(true);
     try {
-      await api.post('/credit-customers', {
-        name: formData.name,
-        phone: formData.phone,
-        email: formData.email || undefined,
-        address: formData.address || undefined,
+      const newCustomer = await api.post('/credit-customers', {
+        name: formData.name.trim(),
+        phone: formData.phone.trim(),
+        email: formData.email.trim() || undefined,
+        address: formData.address.trim() || undefined,
         credit_limit: parseFloat(formData.credit_limit) || 10000,
       });
-      toast.success('Customer added');
+      
+      toast.success(`Credit customer "${newCustomer.name}" added successfully!`, {
+        description: `Customer ID: ${newCustomer.id.slice(0, 8)}...`
+      });
+      
       setShowAddModal(false);
       setFormData({ name: '', phone: '', email: '', address: '', credit_limit: '10000' });
-      loadCustomers();
+      loadCustomers(); // Refresh the list
     } catch (error) {
-      toast.error(error.message);
+      toast.error(error.message || 'Failed to add customer');
     } finally {
       setSaving(false);
     }
@@ -104,40 +123,45 @@ export default function CreditPage() {
 
   const handleRecordPayment = async () => {
     if (!paymentAmount || parseFloat(paymentAmount) <= 0) {
-      toast.error('Enter a valid amount');
+      toast.error('Enter a valid payment amount');
       return;
     }
 
     setSaving(true);
     try {
-      await api.post('/credit-customers/payment', {
+      const result = await api.post('/credit-customers/payment', {
         customer_id: selectedCustomer.id,
         amount: parseFloat(paymentAmount),
         payment_method: 'cash',
-        notes: paymentNotes || undefined,
+        notes: paymentNotes.trim() || undefined,
       });
-      toast.success('Payment recorded');
+      
+      toast.success('Payment recorded successfully!', {
+        description: `New balance: ${formatCurrency(result.new_balance)}`
+      });
+      
       setShowPaymentModal(false);
       setPaymentAmount('');
       setPaymentNotes('');
-      loadCustomers();
+      loadCustomers(); // Refresh the list
     } catch (error) {
-      toast.error(error.message);
+      toast.error(error.message || 'Failed to record payment');
     } finally {
       setSaving(false);
     }
   };
 
-  const handleViewHistory = async (customer) => {
+  const handleViewDetails = async (customer) => {
     setSelectedCustomer(customer);
     setHistoryLoading(true);
-    setShowHistoryModal(true);
+    setShowDetailsModal(true);
     
     try {
       const data = await api.get(`/credit-customers/${customer.id}/history`);
       setHistory(data);
     } catch (error) {
-      toast.error('Failed to load history');
+      toast.error('Failed to load transaction history');
+      setHistory({ sales: [], payments: [] });
     } finally {
       setHistoryLoading(false);
     }
@@ -148,6 +172,26 @@ export default function CreditPage() {
     setPaymentAmount('');
     setPaymentNotes('');
     setShowPaymentModal(true);
+  };
+
+  // Combine and sort transactions for timeline
+  const getTransactionTimeline = () => {
+    const sales = (history.sales || []).map(s => ({
+      ...s,
+      type: 'sale',
+      date: s.created_at,
+      amount: s.total_amount
+    }));
+    const payments = (history.payments || []).map(p => ({
+      ...p,
+      type: 'payment',
+      date: p.created_at,
+      amount: p.amount
+    }));
+    
+    return [...sales, ...payments].sort((a, b) => 
+      new Date(b.date).getTime() - new Date(a.date).getTime()
+    );
   };
 
   return (
@@ -163,25 +207,37 @@ export default function CreditPage() {
           data-testid="add-customer-btn"
         >
           <Plus className="mr-1 h-4 w-4" />
-          Add
+          Add Customer
         </Button>
       </div>
 
       {/* Summary Cards */}
-      <div className="grid grid-cols-2 gap-4">
-        <Card className="bg-orange-50 border-orange-200">
+      <div className="grid grid-cols-2 gap-3">
+        <Card className="bg-gradient-to-br from-orange-50 to-orange-100 border-orange-200">
           <CardContent className="p-4">
-            <p className="text-sm text-orange-600">Total Outstanding</p>
+            <div className="flex items-center gap-2 text-orange-600 mb-1">
+              <AlertCircle className="h-4 w-4" />
+              <span className="text-sm font-medium">Outstanding</span>
+            </div>
             <p className="text-2xl font-bold text-orange-700" style={{ fontFamily: 'Outfit, sans-serif' }}>
               {formatCurrency(totalOutstanding)}
+            </p>
+            <p className="text-xs text-orange-600 mt-1">
+              {customersWithBalance} customer{customersWithBalance !== 1 ? 's' : ''} with balance
             </p>
           </CardContent>
         </Card>
         <Card>
           <CardContent className="p-4">
-            <p className="text-sm text-slate-500">With Balance</p>
+            <div className="flex items-center gap-2 text-slate-600 mb-1">
+              <Users className="h-4 w-4" />
+              <span className="text-sm font-medium">Total Customers</span>
+            </div>
             <p className="text-2xl font-bold" style={{ fontFamily: 'Outfit, sans-serif' }}>
-              {customersWithBalance} / {customers.length}
+              {customers.length}
+            </p>
+            <p className="text-xs text-slate-500 mt-1">
+              Credit limit: {formatCurrency(totalCreditLimit)}
             </p>
           </CardContent>
         </Card>
@@ -191,7 +247,7 @@ export default function CreditPage() {
       <div className="relative">
         <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-5 w-5 text-slate-400" />
         <Input
-          placeholder="Search customers..."
+          placeholder="Search by name or phone..."
           value={searchQuery}
           onChange={(e) => setSearchQuery(e.target.value)}
           className="pl-10"
@@ -199,51 +255,91 @@ export default function CreditPage() {
         />
       </div>
 
+      {/* Tabs */}
+      <Tabs value={activeTab} onValueChange={setActiveTab}>
+        <TabsList className="w-full grid grid-cols-2">
+          <TabsTrigger value="all" data-testid="tab-all">
+            All ({customers.length})
+          </TabsTrigger>
+          <TabsTrigger value="with-balance" data-testid="tab-with-balance">
+            With Balance ({customersWithBalance})
+          </TabsTrigger>
+        </TabsList>
+      </Tabs>
+
       {/* Customers List */}
       {loading ? (
         <div className="space-y-3">
           {[1, 2, 3, 4].map((i) => (
-            <Skeleton key={i} className="h-24 rounded-xl" />
+            <Skeleton key={i} className="h-32 rounded-xl" />
           ))}
         </div>
       ) : filteredCustomers.length === 0 ? (
         <div className="text-center py-12 text-slate-500">
           <Users className="h-16 w-16 mx-auto mb-4 opacity-30" />
-          <p className="font-medium">No credit customers</p>
-          <Button 
-            className="mt-4 bg-[#FF8C00]"
-            onClick={() => setShowAddModal(true)}
-          >
-            Add First Customer
-          </Button>
+          <p className="font-medium">
+            {customers.length === 0 ? 'No credit customers yet' : 'No customers match your search'}
+          </p>
+          {customers.length === 0 && (
+            <Button 
+              className="mt-4 bg-[#FF8C00]"
+              onClick={() => setShowAddModal(true)}
+            >
+              Add First Customer
+            </Button>
+          )}
         </div>
       ) : (
         <div className="space-y-3">
           {filteredCustomers.map((customer) => (
             <Card 
               key={customer.id}
-              className={customer.current_balance > 0 ? 'border-orange-200' : ''}
+              className={`transition-all ${customer.current_balance > 0 ? 'border-orange-200 bg-orange-50/30' : ''}`}
               data-testid={`customer-card-${customer.id}`}
             >
               <CardContent className="p-4">
-                <div className="flex items-center justify-between">
+                <div className="flex items-start justify-between">
                   <div className="flex-1">
-                    <h3 className="font-semibold">{customer.name}</h3>
+                    <h3 className="font-semibold text-lg">{customer.name}</h3>
                     <div className="flex items-center gap-2 text-sm text-slate-500 mt-1">
                       <Phone className="h-4 w-4" />
                       {customer.phone}
                     </div>
-                    <div className="mt-2">
-                      <span className={`text-lg font-bold ${customer.current_balance > 0 ? 'text-orange-600' : 'text-green-600'}`}>
-                        {formatCurrency(customer.current_balance)}
-                      </span>
-                      <span className="text-sm text-slate-500 ml-2">
-                        / {formatCurrency(customer.credit_limit)}
-                      </span>
+                    {customer.email && (
+                      <div className="flex items-center gap-2 text-sm text-slate-500">
+                        <Mail className="h-4 w-4" />
+                        {customer.email}
+                      </div>
+                    )}
+                    
+                    <div className="mt-3 flex items-center gap-4">
+                      <div>
+                        <p className="text-xs text-slate-500">Balance</p>
+                        <p className={`text-xl font-bold ${customer.current_balance > 0 ? 'text-orange-600' : 'text-green-600'}`}>
+                          {formatCurrency(customer.current_balance)}
+                        </p>
+                      </div>
+                      <div className="border-l pl-4">
+                        <p className="text-xs text-slate-500">Limit</p>
+                        <p className="font-semibold">{formatCurrency(customer.credit_limit)}</p>
+                      </div>
                     </div>
+                    
+                    <p className="text-xs text-slate-400 mt-2">
+                      ID: {customer.id.slice(0, 8)}... • Added: {formatDate(customer.created_at)}
+                    </p>
                   </div>
                   
                   <div className="flex flex-col gap-2">
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => handleViewDetails(customer)}
+                      data-testid={`view-details-${customer.id}`}
+                    >
+                      <Eye className="h-4 w-4 mr-1" />
+                      Details
+                    </Button>
                     {customer.current_balance > 0 && (
                       <Button
                         size="sm"
@@ -255,15 +351,6 @@ export default function CreditPage() {
                         Pay
                       </Button>
                     )}
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onClick={() => handleViewHistory(customer)}
-                      data-testid={`view-history-${customer.id}`}
-                    >
-                      <History className="h-4 w-4 mr-1" />
-                      History
-                    </Button>
                   </div>
                 </div>
               </CardContent>
@@ -277,6 +364,9 @@ export default function CreditPage() {
         <DialogContent className="max-w-md mx-4">
           <DialogHeader>
             <DialogTitle>Add Credit Customer</DialogTitle>
+            <DialogDescription>
+              Create a new credit customer account. They will be available for credit sales immediately.
+            </DialogDescription>
           </DialogHeader>
           
           <div className="space-y-4 py-4">
@@ -308,6 +398,7 @@ export default function CreditPage() {
                 value={formData.email}
                 onChange={(e) => setFormData({ ...formData, email: e.target.value })}
                 placeholder="email@example.com"
+                data-testid="customer-email-input"
               />
             </div>
             
@@ -317,11 +408,12 @@ export default function CreditPage() {
                 value={formData.address}
                 onChange={(e) => setFormData({ ...formData, address: e.target.value })}
                 placeholder="Physical address"
+                data-testid="customer-address-input"
               />
             </div>
             
             <div className="space-y-2">
-              <Label>Credit Limit</Label>
+              <Label>Credit Limit (KES)</Label>
               <Input
                 type="number"
                 value={formData.credit_limit}
@@ -329,6 +421,7 @@ export default function CreditPage() {
                 placeholder="10000"
                 data-testid="customer-limit-input"
               />
+              <p className="text-xs text-slate-500">Maximum amount the customer can owe</p>
             </div>
           </div>
 
@@ -354,16 +447,22 @@ export default function CreditPage() {
         <DialogContent className="max-w-md mx-4">
           <DialogHeader>
             <DialogTitle>Record Payment</DialogTitle>
+            <DialogDescription>
+              Record a payment received from this credit customer
+            </DialogDescription>
           </DialogHeader>
           
           {selectedCustomer && (
             <div className="space-y-4 py-4">
               <div className="p-4 bg-slate-50 rounded-xl">
-                <p className="font-semibold">{selectedCustomer.name}</p>
+                <p className="font-semibold text-lg">{selectedCustomer.name}</p>
                 <p className="text-sm text-slate-500">{selectedCustomer.phone}</p>
-                <p className="text-lg font-bold text-orange-600 mt-2">
-                  Balance: {formatCurrency(selectedCustomer.current_balance)}
-                </p>
+                <div className="mt-3 p-3 bg-orange-100 rounded-lg">
+                  <p className="text-sm text-orange-600">Current Balance</p>
+                  <p className="text-2xl font-bold text-orange-700">
+                    {formatCurrency(selectedCustomer.current_balance)}
+                  </p>
+                </div>
               </div>
               
               <div className="space-y-2">
@@ -384,8 +483,18 @@ export default function CreditPage() {
                   value={paymentNotes}
                   onChange={(e) => setPaymentNotes(e.target.value)}
                   placeholder="Payment notes"
+                  data-testid="payment-notes-input"
                 />
               </div>
+
+              {paymentAmount && parseFloat(paymentAmount) > 0 && (
+                <div className="p-3 bg-green-50 rounded-lg">
+                  <p className="text-sm text-green-600">New Balance After Payment</p>
+                  <p className="text-xl font-bold text-green-700">
+                    {formatCurrency(Math.max(0, selectedCustomer.current_balance - parseFloat(paymentAmount)))}
+                  </p>
+                </div>
+              )}
             </div>
           )}
 
@@ -406,79 +515,149 @@ export default function CreditPage() {
         </DialogContent>
       </Dialog>
 
-      {/* History Modal */}
-      <Dialog open={showHistoryModal} onOpenChange={setShowHistoryModal}>
-        <DialogContent className="max-w-md mx-4 max-h-[80vh] overflow-y-auto">
+      {/* Customer Details Modal */}
+      <Dialog open={showDetailsModal} onOpenChange={setShowDetailsModal}>
+        <DialogContent className="max-w-md mx-4 max-h-[85vh] overflow-y-auto">
           <DialogHeader>
-            <DialogTitle>Transaction History</DialogTitle>
+            <DialogTitle>Customer Details</DialogTitle>
+            <DialogDescription className="sr-only">
+              View customer information and transaction history
+            </DialogDescription>
           </DialogHeader>
           
           {selectedCustomer && (
             <div className="space-y-4 py-4">
+              {/* Customer Info */}
               <div className="p-4 bg-slate-50 rounded-xl">
-                <p className="font-semibold">{selectedCustomer.name}</p>
-                <p className="text-lg font-bold text-orange-600 mt-1">
-                  Current Balance: {formatCurrency(selectedCustomer.current_balance)}
+                <h3 className="font-bold text-lg">{selectedCustomer.name}</h3>
+                <div className="space-y-1 mt-2 text-sm text-slate-600">
+                  <div className="flex items-center gap-2">
+                    <Phone className="h-4 w-4" />
+                    {selectedCustomer.phone}
+                  </div>
+                  {selectedCustomer.email && (
+                    <div className="flex items-center gap-2">
+                      <Mail className="h-4 w-4" />
+                      {selectedCustomer.email}
+                    </div>
+                  )}
+                  {selectedCustomer.address && (
+                    <div className="flex items-center gap-2">
+                      <MapPin className="h-4 w-4" />
+                      {selectedCustomer.address}
+                    </div>
+                  )}
+                </div>
+                <p className="text-xs text-slate-400 mt-2">
+                  Customer ID: {selectedCustomer.id}
                 </p>
               </div>
-              
-              {historyLoading ? (
-                <div className="space-y-2">
-                  {[1, 2, 3].map((i) => (
-                    <Skeleton key={i} className="h-16 rounded-lg" />
-                  ))}
+
+              {/* Balance Summary */}
+              <div className="grid grid-cols-2 gap-3">
+                <div className="p-3 bg-orange-50 rounded-lg border border-orange-200">
+                  <p className="text-xs text-orange-600">Outstanding</p>
+                  <p className="text-xl font-bold text-orange-700">
+                    {formatCurrency(selectedCustomer.current_balance)}
+                  </p>
                 </div>
-              ) : (
-                <>
-                  {/* Credit Purchases */}
-                  <div>
-                    <h4 className="font-semibold text-sm text-slate-500 mb-2">Credit Purchases</h4>
-                    {history.sales.length === 0 ? (
-                      <p className="text-sm text-slate-400">No credit purchases</p>
-                    ) : (
-                      <div className="space-y-2">
-                        {history.sales.map((sale) => (
-                          <div key={sale.id} className="p-3 bg-orange-50 rounded-lg">
-                            <div className="flex justify-between">
-                              <span className="text-sm">{sale.receipt_number}</span>
-                              <span className="font-bold text-orange-600">+{formatCurrency(sale.total_amount)}</span>
-                            </div>
-                            <p className="text-xs text-slate-500">{formatDate(sale.created_at)}</p>
-                          </div>
-                        ))}
-                      </div>
-                    )}
+                <div className="p-3 bg-slate-50 rounded-lg">
+                  <p className="text-xs text-slate-500">Credit Limit</p>
+                  <p className="text-xl font-bold">
+                    {formatCurrency(selectedCustomer.credit_limit)}
+                  </p>
+                </div>
+              </div>
+
+              {/* Available Credit */}
+              <div className="p-3 bg-blue-50 rounded-lg border border-blue-200">
+                <p className="text-xs text-blue-600">Available Credit</p>
+                <p className="text-lg font-bold text-blue-700">
+                  {formatCurrency(Math.max(0, selectedCustomer.credit_limit - selectedCustomer.current_balance))}
+                </p>
+              </div>
+
+              {/* Transaction History */}
+              <div>
+                <h4 className="font-semibold mb-3 flex items-center gap-2">
+                  <History className="h-4 w-4" />
+                  Transaction History
+                </h4>
+                
+                {historyLoading ? (
+                  <div className="space-y-2">
+                    {[1, 2, 3].map((i) => (
+                      <Skeleton key={i} className="h-16 rounded-lg" />
+                    ))}
                   </div>
-                  
-                  {/* Payments */}
-                  <div>
-                    <h4 className="font-semibold text-sm text-slate-500 mb-2">Payments Received</h4>
-                    {history.payments.length === 0 ? (
-                      <p className="text-sm text-slate-400">No payments recorded</p>
-                    ) : (
-                      <div className="space-y-2">
-                        {history.payments.map((payment) => (
-                          <div key={payment.id} className="p-3 bg-green-50 rounded-lg">
-                            <div className="flex justify-between">
-                              <span className="text-sm">Payment</span>
-                              <span className="font-bold text-green-600">-{formatCurrency(payment.amount)}</span>
-                            </div>
-                            <p className="text-xs text-slate-500">{formatDate(payment.created_at)}</p>
-                            {payment.notes && (
-                              <p className="text-xs text-slate-600 mt-1">{payment.notes}</p>
+                ) : getTransactionTimeline().length === 0 ? (
+                  <p className="text-sm text-slate-400 text-center py-4">
+                    No transactions yet
+                  </p>
+                ) : (
+                  <div className="space-y-2 max-h-64 overflow-y-auto">
+                    {getTransactionTimeline().map((txn, idx) => (
+                      <div 
+                        key={txn.id || idx}
+                        className={`p-3 rounded-lg ${
+                          txn.type === 'sale' ? 'bg-orange-50' : 'bg-green-50'
+                        }`}
+                      >
+                        <div className="flex justify-between items-start">
+                          <div className="flex items-center gap-2">
+                            {txn.type === 'sale' ? (
+                              <TrendingUp className="h-4 w-4 text-orange-600" />
+                            ) : (
+                              <TrendingDown className="h-4 w-4 text-green-600" />
                             )}
+                            <span className="text-sm font-medium">
+                              {txn.type === 'sale' ? 'Credit Sale' : 'Payment'}
+                            </span>
                           </div>
-                        ))}
+                          <span className={`font-bold ${
+                            txn.type === 'sale' ? 'text-orange-600' : 'text-green-600'
+                          }`}>
+                            {txn.type === 'sale' ? '+' : '-'}{formatCurrency(txn.amount)}
+                          </span>
+                        </div>
+                        <p className="text-xs text-slate-500 mt-1">
+                          {formatDateTime(txn.date)}
+                        </p>
+                        {txn.type === 'sale' && txn.receipt_number && (
+                          <p className="text-xs text-slate-400 flex items-center gap-1 mt-1">
+                            <Receipt className="h-3 w-3" />
+                            {txn.receipt_number}
+                          </p>
+                        )}
+                        {txn.notes && (
+                          <p className="text-xs text-slate-500 mt-1 italic">
+                            "{txn.notes}"
+                          </p>
+                        )}
                       </div>
-                    )}
+                    ))}
                   </div>
-                </>
+                )}
+              </div>
+
+              {/* Quick Actions */}
+              {selectedCustomer.current_balance > 0 && (
+                <Button 
+                  className="w-full bg-green-600"
+                  onClick={() => {
+                    setShowDetailsModal(false);
+                    openPaymentModal(selectedCustomer);
+                  }}
+                >
+                  <DollarSign className="h-4 w-4 mr-2" />
+                  Record Payment
+                </Button>
               )}
             </div>
           )}
 
           <DialogFooter>
-            <Button variant="outline" onClick={() => setShowHistoryModal(false)}>
+            <Button variant="outline" onClick={() => setShowDetailsModal(false)} className="w-full">
               Close
             </Button>
           </DialogFooter>
