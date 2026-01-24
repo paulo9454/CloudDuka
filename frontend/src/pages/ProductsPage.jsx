@@ -6,6 +6,7 @@ import { Button } from '../components/ui/button';
 import { Input } from '../components/ui/input';
 import { Label } from '../components/ui/label';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '../components/ui/dialog';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../components/ui/select';
 import { Skeleton } from '../components/ui/skeleton';
 import { toast } from 'sonner';
 import { 
@@ -16,8 +17,16 @@ import {
   Trash2, 
   AlertTriangle,
   Loader2,
-  Check
+  Check,
+  Calculator
 } from 'lucide-react';
+
+// Unit types with their multipliers for auto-division
+const UNIT_TYPES = [
+  { value: 'single', label: 'Single', multiplier: 1 },
+  { value: 'packet', label: 'Packet', multiplier: 1 }, // User defines items per packet
+  { value: 'dozen', label: 'Dozen', multiplier: 12 },
+];
 
 export default function ProductsPage() {
   const [searchParams] = useSearchParams();
@@ -36,14 +45,17 @@ export default function ProductsPage() {
   const [editingProduct, setEditingProduct] = useState(null);
   const [saving, setSaving] = useState(false);
   
-  // Simple form state - retail unit only
+  // Form state
   const [formData, setFormData] = useState({
     name: '',
     sku: '',
     category: '',
-    unit_price: '',
-    cost_price: '',
-    stock_quantity: '',
+    unit_price: '', // Selling price per single unit
+    buying_unit: 'single', // How you buy: single, packet, dozen
+    buying_cost: '', // Cost for the buying unit
+    items_per_packet: '10', // Only used when buying_unit is 'packet'
+    cost_per_unit: '', // Auto-calculated cost per single unit
+    stock_quantity: '', // Always in single units
     min_stock_level: '5',
   });
 
@@ -51,6 +63,29 @@ export default function ProductsPage() {
     loadProducts();
     loadCategories();
   }, []);
+
+  // Auto-calculate cost per unit when buying details change
+  useEffect(() => {
+    calculateCostPerUnit();
+  }, [formData.buying_unit, formData.buying_cost, formData.items_per_packet]);
+
+  const calculateCostPerUnit = () => {
+    const cost = parseFloat(formData.buying_cost) || 0;
+    if (cost <= 0) {
+      setFormData(prev => ({ ...prev, cost_per_unit: '' }));
+      return;
+    }
+
+    let divisor = 1;
+    if (formData.buying_unit === 'dozen') {
+      divisor = 12;
+    } else if (formData.buying_unit === 'packet') {
+      divisor = parseInt(formData.items_per_packet) || 1;
+    }
+
+    const costPerUnit = (cost / divisor).toFixed(2);
+    setFormData(prev => ({ ...prev, cost_per_unit: costPerUnit }));
+  };
 
   const loadProducts = async () => {
     try {
@@ -89,7 +124,10 @@ export default function ProductsPage() {
         sku: product.sku || '',
         category: product.category || '',
         unit_price: product.unit_price.toString(),
-        cost_price: product.cost_price?.toString() || '',
+        buying_unit: product.unit || 'single',
+        buying_cost: '',
+        items_per_packet: '10',
+        cost_per_unit: product.cost_price?.toString() || '',
         stock_quantity: product.stock_quantity.toString(),
         min_stock_level: product.min_stock_level.toString(),
       });
@@ -100,7 +138,10 @@ export default function ProductsPage() {
         sku: '',
         category: '',
         unit_price: '',
-        cost_price: '',
+        buying_unit: 'single',
+        buying_cost: '',
+        items_per_packet: '10',
+        cost_per_unit: '',
         stock_quantity: '',
         min_stock_level: '5',
       });
@@ -109,22 +150,27 @@ export default function ProductsPage() {
   };
 
   const handleSave = async () => {
-    if (!formData.name || !formData.unit_price) {
-      toast.error('Name and selling price are required');
+    // Only name and selling price are required
+    if (!formData.name.trim()) {
+      toast.error('Product name is required');
+      return;
+    }
+    if (!formData.unit_price || parseFloat(formData.unit_price) <= 0) {
+      toast.error('Selling price is required');
       return;
     }
 
     setSaving(true);
     try {
       const data = {
-        name: formData.name,
-        sku: formData.sku || undefined,
-        category: formData.category || undefined,
+        name: formData.name.trim(),
+        sku: formData.sku.trim() || undefined,
+        category: formData.category.trim() || undefined,
         unit_price: parseFloat(formData.unit_price),
-        cost_price: formData.cost_price ? parseFloat(formData.cost_price) : undefined,
+        cost_price: formData.cost_per_unit ? parseFloat(formData.cost_per_unit) : undefined,
         stock_quantity: parseInt(formData.stock_quantity) || 0,
         min_stock_level: parseInt(formData.min_stock_level) || 5,
-        unit: 'piece', // Always retail unit
+        unit: formData.buying_unit,
       };
 
       if (editingProduct) {
@@ -139,7 +185,7 @@ export default function ProductsPage() {
       loadProducts();
       loadCategories();
     } catch (error) {
-      toast.error(error.message);
+      toast.error(error.message || 'Failed to save product');
     } finally {
       setSaving(false);
     }
@@ -205,7 +251,7 @@ export default function ProductsPage() {
         </Button>
       </div>
 
-      {/* Category Filter - Simple chips */}
+      {/* Category Filter */}
       {categories.length > 0 && (
         <div className="flex gap-2 overflow-x-auto pb-2">
           <Button
@@ -272,12 +318,17 @@ export default function ProductsPage() {
                     {product.sku && (
                       <p className="text-sm text-slate-500">SKU: {product.sku}</p>
                     )}
-                    <div className="flex items-center gap-4 mt-2">
+                    <div className="flex items-center gap-3 mt-2 flex-wrap">
                       <span className="text-lg font-bold text-[#007BFF]">
                         {formatCurrency(product.unit_price)}
                       </span>
+                      {product.cost_price && (
+                        <span className="text-sm text-slate-500">
+                          Cost: {formatCurrency(product.cost_price)}
+                        </span>
+                      )}
                       {product.category && (
-                        <span className="text-sm text-slate-500 bg-slate-100 px-2 py-0.5 rounded">
+                        <span className="text-xs text-slate-500 bg-slate-100 px-2 py-0.5 rounded">
                           {product.category}
                         </span>
                       )}
@@ -338,7 +389,7 @@ export default function ProductsPage() {
         </div>
       )}
 
-      {/* Add/Edit Product Modal - Simple fields only */}
+      {/* Add/Edit Product Modal */}
       <Dialog open={showModal} onOpenChange={setShowModal}>
         <DialogContent className="max-w-md mx-4 max-h-[90vh] overflow-y-auto">
           <DialogHeader>
@@ -349,6 +400,7 @@ export default function ProductsPage() {
           </DialogHeader>
           
           <div className="space-y-4 py-4">
+            {/* Product Name */}
             <div className="space-y-2">
               <Label>Product Name *</Label>
               <Input
@@ -359,32 +411,90 @@ export default function ProductsPage() {
               />
             </div>
 
-            <div className="grid grid-cols-2 gap-4">
-              <div className="space-y-2">
-                <Label>Selling Price *</Label>
-                <Input
-                  type="number"
-                  value={formData.unit_price}
-                  onChange={(e) => setFormData({ ...formData, unit_price: e.target.value })}
-                  placeholder="0"
-                  data-testid="product-price-input"
-                />
-              </div>
-              <div className="space-y-2">
-                <Label>Cost Price</Label>
-                <Input
-                  type="number"
-                  value={formData.cost_price}
-                  onChange={(e) => setFormData({ ...formData, cost_price: e.target.value })}
-                  placeholder="0"
-                  data-testid="product-cost-input"
-                />
-              </div>
+            {/* Selling Price */}
+            <div className="space-y-2">
+              <Label>Selling Price (per unit) *</Label>
+              <Input
+                type="number"
+                value={formData.unit_price}
+                onChange={(e) => setFormData({ ...formData, unit_price: e.target.value })}
+                placeholder="0"
+                data-testid="product-price-input"
+              />
             </div>
 
+            {/* Buying Unit Type */}
+            <div className="space-y-2">
+              <Label>How do you buy this product?</Label>
+              <Select 
+                value={formData.buying_unit} 
+                onValueChange={(v) => setFormData({ ...formData, buying_unit: v })}
+              >
+                <SelectTrigger data-testid="buying-unit-select">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="single">Single Unit</SelectItem>
+                  <SelectItem value="packet">Packet</SelectItem>
+                  <SelectItem value="dozen">Dozen (12 units)</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+
+            {/* Items per packet - only show if packet selected */}
+            {formData.buying_unit === 'packet' && (
+              <div className="space-y-2">
+                <Label>Items per Packet</Label>
+                <Input
+                  type="number"
+                  value={formData.items_per_packet}
+                  onChange={(e) => setFormData({ ...formData, items_per_packet: e.target.value })}
+                  placeholder="10"
+                  min="1"
+                  data-testid="items-per-packet-input"
+                />
+              </div>
+            )}
+
+            {/* Buying Cost */}
+            <div className="space-y-2">
+              <Label>
+                Buying Cost {formData.buying_unit === 'single' ? '(per unit)' : 
+                  formData.buying_unit === 'dozen' ? '(per dozen)' : 
+                  `(per packet of ${formData.items_per_packet})`}
+              </Label>
+              <Input
+                type="number"
+                value={formData.buying_cost}
+                onChange={(e) => setFormData({ ...formData, buying_cost: e.target.value })}
+                placeholder="0"
+                data-testid="buying-cost-input"
+              />
+            </div>
+
+            {/* Auto-calculated Cost per Unit */}
+            {formData.cost_per_unit && formData.buying_unit !== 'single' && (
+              <div className="p-3 bg-blue-50 rounded-lg border border-blue-200">
+                <div className="flex items-center gap-2 text-blue-700">
+                  <Calculator className="h-4 w-4" />
+                  <span className="text-sm font-medium">Auto-calculated</span>
+                </div>
+                <p className="text-lg font-bold text-blue-800 mt-1">
+                  Cost per unit: {formatCurrency(parseFloat(formData.cost_per_unit))}
+                </p>
+                <p className="text-xs text-blue-600 mt-1">
+                  {formData.buying_unit === 'dozen' 
+                    ? `${formData.buying_cost} ÷ 12 = ${formData.cost_per_unit}`
+                    : `${formData.buying_cost} ÷ ${formData.items_per_packet} = ${formData.cost_per_unit}`
+                  }
+                </p>
+              </div>
+            )}
+
+            {/* Stock Quantity */}
             <div className="grid grid-cols-2 gap-4">
               <div className="space-y-2">
-                <Label>Stock Quantity</Label>
+                <Label>Stock (units)</Label>
                 <Input
                   type="number"
                   value={formData.stock_quantity}
@@ -405,8 +515,9 @@ export default function ProductsPage() {
               </div>
             </div>
 
+            {/* Category - Optional free text */}
             <div className="space-y-2">
-              <Label>Category (Optional)</Label>
+              <Label>Category (optional)</Label>
               <Input
                 value={formData.category}
                 onChange={(e) => setFormData({ ...formData, category: e.target.value })}
@@ -419,11 +530,11 @@ export default function ProductsPage() {
                   <option key={c} value={c} />
                 ))}
               </datalist>
-              <p className="text-xs text-slate-500">For filtering only - optional</p>
             </div>
 
+            {/* SKU - Optional */}
             <div className="space-y-2">
-              <Label>SKU (Optional)</Label>
+              <Label>SKU (optional)</Label>
               <Input
                 value={formData.sku}
                 onChange={(e) => setFormData({ ...formData, sku: e.target.value })}
