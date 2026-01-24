@@ -18,15 +18,9 @@ import {
   AlertTriangle,
   Loader2,
   Check,
-  Calculator
+  Calculator,
+  Lock
 } from 'lucide-react';
-
-// Unit types with their multipliers for auto-division
-const UNIT_TYPES = [
-  { value: 'single', label: 'Single', multiplier: 1 },
-  { value: 'packet', label: 'Packet', multiplier: 1 }, // User defines items per packet
-  { value: 'dozen', label: 'Dozen', multiplier: 12 },
-];
 
 export default function ProductsPage() {
   const [searchParams] = useSearchParams();
@@ -52,10 +46,11 @@ export default function ProductsPage() {
     category: '',
     unit_price: '', // Selling price per single unit
     buying_unit: 'single', // How you buy: single, packet, dozen
-    buying_cost: '', // Cost for the buying unit
+    buying_quantity: '1', // Number of packets/dozens you're buying
+    buying_cost: '', // Total cost for what you're buying
     items_per_packet: '10', // Only used when buying_unit is 'packet'
     cost_per_unit: '', // Auto-calculated cost per single unit
-    stock_quantity: '', // Always in single units
+    stock_quantity: '', // Auto-calculated total units (locked when packet/dozen)
     min_stock_level: '5',
   });
 
@@ -64,27 +59,36 @@ export default function ProductsPage() {
     loadCategories();
   }, []);
 
-  // Auto-calculate cost per unit when buying details change
+  // Auto-calculate cost per unit and total stock when buying details change
   useEffect(() => {
-    calculateCostPerUnit();
-  }, [formData.buying_unit, formData.buying_cost, formData.items_per_packet]);
+    calculateValues();
+  }, [formData.buying_unit, formData.buying_cost, formData.items_per_packet, formData.buying_quantity]);
 
-  const calculateCostPerUnit = () => {
+  const calculateValues = () => {
     const cost = parseFloat(formData.buying_cost) || 0;
-    if (cost <= 0) {
-      setFormData(prev => ({ ...prev, cost_per_unit: '' }));
-      return;
-    }
-
-    let divisor = 1;
+    const buyingQty = parseInt(formData.buying_quantity) || 1;
+    
+    let unitsPerBuy = 1;
     if (formData.buying_unit === 'dozen') {
-      divisor = 12;
+      unitsPerBuy = 12;
     } else if (formData.buying_unit === 'packet') {
-      divisor = parseInt(formData.items_per_packet) || 1;
+      unitsPerBuy = parseInt(formData.items_per_packet) || 1;
     }
 
-    const costPerUnit = (cost / divisor).toFixed(2);
-    setFormData(prev => ({ ...prev, cost_per_unit: costPerUnit }));
+    // Calculate total units (number of packets/dozens × units per packet/dozen)
+    const totalUnits = buyingQty * unitsPerBuy;
+    
+    // Calculate cost per unit
+    let costPerUnit = '';
+    if (cost > 0) {
+      costPerUnit = (cost / totalUnits).toFixed(2);
+    }
+
+    setFormData(prev => ({ 
+      ...prev, 
+      cost_per_unit: costPerUnit,
+      stock_quantity: formData.buying_unit === 'single' ? prev.stock_quantity : totalUnits.toString()
+    }));
   };
 
   const loadProducts = async () => {
@@ -124,7 +128,8 @@ export default function ProductsPage() {
         sku: product.sku || '',
         category: product.category || '',
         unit_price: product.unit_price.toString(),
-        buying_unit: product.unit || 'single',
+        buying_unit: 'single', // Reset to single when editing
+        buying_quantity: '1',
         buying_cost: '',
         items_per_packet: '10',
         cost_per_unit: product.cost_price?.toString() || '',
@@ -139,6 +144,7 @@ export default function ProductsPage() {
         category: '',
         unit_price: '',
         buying_unit: 'single',
+        buying_quantity: '1',
         buying_cost: '',
         items_per_packet: '10',
         cost_per_unit: '',
@@ -150,7 +156,6 @@ export default function ProductsPage() {
   };
 
   const handleSave = async () => {
-    // Only name and selling price are required
     if (!formData.name.trim()) {
       toast.error('Product name is required');
       return;
@@ -170,7 +175,7 @@ export default function ProductsPage() {
         cost_price: formData.cost_per_unit ? parseFloat(formData.cost_per_unit) : undefined,
         stock_quantity: parseInt(formData.stock_quantity) || 0,
         min_stock_level: parseInt(formData.min_stock_level) || 5,
-        unit: formData.buying_unit,
+        unit: 'piece', // Always store as single units
       };
 
       if (editingProduct) {
@@ -211,6 +216,8 @@ export default function ProductsPage() {
       toast.error('Failed to update stock');
     }
   };
+
+  const isStockLocked = formData.buying_unit !== 'single';
 
   return (
     <div className="p-4 space-y-4" data-testid="products-page">
@@ -428,7 +435,7 @@ export default function ProductsPage() {
               <Label>How do you buy this product?</Label>
               <Select 
                 value={formData.buying_unit} 
-                onValueChange={(v) => setFormData({ ...formData, buying_unit: v })}
+                onValueChange={(v) => setFormData({ ...formData, buying_unit: v, buying_quantity: '1' })}
               >
                 <SelectTrigger data-testid="buying-unit-select">
                   <SelectValue />
@@ -444,7 +451,7 @@ export default function ProductsPage() {
             {/* Items per packet - only show if packet selected */}
             {formData.buying_unit === 'packet' && (
               <div className="space-y-2">
-                <Label>Items per Packet</Label>
+                <Label>Units per Packet</Label>
                 <Input
                   type="number"
                   value={formData.items_per_packet}
@@ -456,12 +463,30 @@ export default function ProductsPage() {
               </div>
             )}
 
+            {/* Number of packets/dozens buying */}
+            {formData.buying_unit !== 'single' && (
+              <div className="space-y-2">
+                <Label>
+                  Number of {formData.buying_unit === 'dozen' ? 'Dozens' : 'Packets'} Buying
+                </Label>
+                <Input
+                  type="number"
+                  value={formData.buying_quantity}
+                  onChange={(e) => setFormData({ ...formData, buying_quantity: e.target.value })}
+                  placeholder="1"
+                  min="1"
+                  data-testid="buying-quantity-input"
+                />
+              </div>
+            )}
+
             {/* Buying Cost */}
             <div className="space-y-2">
               <Label>
-                Buying Cost {formData.buying_unit === 'single' ? '(per unit)' : 
-                  formData.buying_unit === 'dozen' ? '(per dozen)' : 
-                  `(per packet of ${formData.items_per_packet})`}
+                Total Buying Cost {formData.buying_unit === 'single' ? '(per unit)' : 
+                  formData.buying_unit === 'dozen' 
+                    ? `(for ${formData.buying_quantity} dozen${parseInt(formData.buying_quantity) > 1 ? 's' : ''})` 
+                    : `(for ${formData.buying_quantity} packet${parseInt(formData.buying_quantity) > 1 ? 's' : ''})`}
               </Label>
               <Input
                 type="number"
@@ -472,36 +497,63 @@ export default function ProductsPage() {
               />
             </div>
 
-            {/* Auto-calculated Cost per Unit */}
-            {formData.cost_per_unit && formData.buying_unit !== 'single' && (
+            {/* Auto-calculated values */}
+            {formData.buying_unit !== 'single' && (formData.buying_cost || formData.buying_quantity) && (
               <div className="p-3 bg-blue-50 rounded-lg border border-blue-200">
                 <div className="flex items-center gap-2 text-blue-700">
                   <Calculator className="h-4 w-4" />
                   <span className="text-sm font-medium">Auto-calculated</span>
                 </div>
-                <p className="text-lg font-bold text-blue-800 mt-1">
-                  Cost per unit: {formatCurrency(parseFloat(formData.cost_per_unit))}
-                </p>
-                <p className="text-xs text-blue-600 mt-1">
-                  {formData.buying_unit === 'dozen' 
-                    ? `${formData.buying_cost} ÷ 12 = ${formData.cost_per_unit}`
-                    : `${formData.buying_cost} ÷ ${formData.items_per_packet} = ${formData.cost_per_unit}`
-                  }
-                </p>
+                
+                {/* Total Units */}
+                <div className="mt-2 p-2 bg-white rounded">
+                  <div className="flex items-center gap-2">
+                    <Lock className="h-3 w-3 text-slate-400" />
+                    <span className="text-sm text-slate-600">Total Units:</span>
+                    <span className="font-bold text-blue-800">{formData.stock_quantity}</span>
+                  </div>
+                  <p className="text-xs text-slate-500 mt-1">
+                    {formData.buying_unit === 'dozen' 
+                      ? `${formData.buying_quantity} × 12 = ${formData.stock_quantity} units`
+                      : `${formData.buying_quantity} × ${formData.items_per_packet} = ${formData.stock_quantity} units`
+                    }
+                  </p>
+                </div>
+
+                {/* Cost per Unit */}
+                {formData.cost_per_unit && (
+                  <div className="mt-2 p-2 bg-white rounded">
+                    <span className="text-sm text-slate-600">Cost per unit:</span>
+                    <span className="font-bold text-blue-800 ml-2">
+                      {formatCurrency(parseFloat(formData.cost_per_unit))}
+                    </span>
+                    <p className="text-xs text-slate-500 mt-1">
+                      {formData.buying_cost} ÷ {formData.stock_quantity} = {formData.cost_per_unit}
+                    </p>
+                  </div>
+                )}
               </div>
             )}
 
-            {/* Stock Quantity */}
+            {/* Stock Quantity - editable only when single */}
             <div className="grid grid-cols-2 gap-4">
               <div className="space-y-2">
-                <Label>Stock (units)</Label>
+                <Label className="flex items-center gap-2">
+                  Stock (units)
+                  {isStockLocked && <Lock className="h-3 w-3 text-slate-400" />}
+                </Label>
                 <Input
                   type="number"
                   value={formData.stock_quantity}
                   onChange={(e) => setFormData({ ...formData, stock_quantity: e.target.value })}
                   placeholder="0"
+                  disabled={isStockLocked}
+                  className={isStockLocked ? 'bg-slate-100' : ''}
                   data-testid="product-stock-input"
                 />
+                {isStockLocked && (
+                  <p className="text-xs text-slate-500">Auto-calculated from buying quantity</p>
+                )}
               </div>
               <div className="space-y-2">
                 <Label>Min Stock Level</Label>
