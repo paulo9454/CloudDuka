@@ -559,6 +559,9 @@ class CloudDukaPOSAPITester:
         # Settings tests
         self.test_shop_settings()
         
+        # Category deletion test (after other tests)
+        self.test_delete_category()
+        
         # Print summary
         print("=" * 60)
         print(f"📊 Test Summary:")
