@@ -226,12 +226,12 @@ class CloudDukaPOSAPITester:
         
         if success:
             self.log_result("Delete Category", True)
-            # Verify category is gone
+            # Verify category is gone - should return 404
             get_success, get_data = self.make_request('GET', f'categories/{self.test_category_id}', expected_status=404)
-            if not get_success:  # Should fail with 404
+            if get_success:  # Should succeed with 404 status
                 self.log_result("Verify Category Deleted", True)
             else:
-                self.log_result("Verify Category Deleted", False, "Category still exists after deletion")
+                self.log_result("Verify Category Deleted", False, "Category deletion verification failed")
         else:
             self.log_result("Delete Category", False, f"Category deletion failed: {data}")
         
