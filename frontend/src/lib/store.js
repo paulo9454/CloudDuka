@@ -173,39 +173,39 @@ export const api = {
   get: async (endpoint) => {
     const headers = useAuthStore.getState().getAuthHeaders();
     const res = await fetch(`${API_URL}${endpoint}`, { headers });
+    const data = await res.json().catch(() => ({ detail: 'Request failed' }));
     if (!res.ok) {
-      const error = await res.json().catch(() => ({ detail: 'Request failed' }));
-      throw new Error(error.detail || 'Request failed');
+      throw new Error(data.detail || 'Request failed');
     }
-    return res.json();
+    return data;
   },
 
-  post: async (endpoint, data) => {
+  post: async (endpoint, body) => {
     const headers = useAuthStore.getState().getAuthHeaders();
     const res = await fetch(`${API_URL}${endpoint}`, {
       method: 'POST',
       headers: { ...headers, 'Content-Type': 'application/json' },
-      body: JSON.stringify(data),
+      body: JSON.stringify(body),
     });
+    const data = await res.json().catch(() => ({ detail: 'Request failed' }));
     if (!res.ok) {
-      const error = await res.json().catch(() => ({ detail: 'Request failed' }));
-      throw new Error(error.detail || 'Request failed');
+      throw new Error(data.detail || 'Request failed');
     }
-    return res.json();
+    return data;
   },
 
-  put: async (endpoint, data) => {
+  put: async (endpoint, body) => {
     const headers = useAuthStore.getState().getAuthHeaders();
     const res = await fetch(`${API_URL}${endpoint}`, {
       method: 'PUT',
       headers: { ...headers, 'Content-Type': 'application/json' },
-      body: JSON.stringify(data),
+      body: JSON.stringify(body),
     });
+    const data = await res.json().catch(() => ({ detail: 'Request failed' }));
     if (!res.ok) {
-      const error = await res.json().catch(() => ({ detail: 'Request failed' }));
-      throw new Error(error.detail || 'Request failed');
+      throw new Error(data.detail || 'Request failed');
     }
-    return res.json();
+    return data;
   },
 
   delete: async (endpoint) => {
@@ -214,11 +214,11 @@ export const api = {
       method: 'DELETE',
       headers,
     });
+    const data = await res.json().catch(() => ({ detail: 'Request failed' }));
     if (!res.ok) {
-      const error = await res.json().catch(() => ({ detail: 'Request failed' }));
-      throw new Error(error.detail || 'Request failed');
+      throw new Error(data.detail || 'Request failed');
     }
-    return res.json();
+    return data;
   },
 };
 
