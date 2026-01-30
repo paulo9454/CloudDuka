@@ -159,11 +159,11 @@ export default function SettingsPage() {
               <p className="text-sm font-medium mb-2">Upgrade Options:</p>
               <div className="grid grid-cols-2 gap-2">
                 <div className="p-2 border rounded-lg text-center">
-                  <p className="text-sm font-bold text-[#007BFF]">KES 499</p>
+                  <p className="text-sm font-bold text-[#007BFF]">KES 300</p>
                   <p className="text-xs text-slate-500">Monthly</p>
                 </div>
                 <div className="p-2 border rounded-lg text-center bg-[#007BFF]/5 border-[#007BFF]">
-                  <p className="text-sm font-bold text-[#007BFF]">KES 5,000</p>
+                  <p className="text-sm font-bold text-[#007BFF]">KES 3,000</p>
                   <p className="text-xs text-slate-500">Yearly (Save 17%)</p>
                 </div>
               </div>
