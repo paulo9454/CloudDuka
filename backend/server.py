@@ -297,6 +297,9 @@ def generate_receipt_number():
 def generate_sku():
     return f"SKU-{str(uuid.uuid4())[:8].upper()}"
 
+def generate_purchase_number():
+    return f"PO-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{str(uuid.uuid4())[:4].upper()}"
+
 # =============================================================================
 # AUTH ROUTES
 # =============================================================================
