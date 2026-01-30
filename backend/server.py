@@ -1197,6 +1197,213 @@ async def generate_damaged_pdf(
     return {"pdf": pdf_base64, "filename": f"damaged_report_{start_date[:10]}_{end_date[:10]}.pdf"}
 
 # =============================================================================
+# SUPPLIER ROUTES
+# =============================================================================
+
+@api_router.post("/suppliers", response_model=SupplierResponse)
+async def create_supplier(data: SupplierCreate, user: dict = Depends(get_current_user)):
+    supplier_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    
+    supplier = {
+        "id": supplier_id,
+        "name": data.name,
+        "phone": data.phone,
+        "notes": data.notes,
+        "shop_id": user["shop_id"],
+        "created_at": now
+    }
+    
+    await db.suppliers.insert_one(supplier)
+    return SupplierResponse(**supplier)
+
+@api_router.get("/suppliers", response_model=List[SupplierResponse])
+async def list_suppliers(
+    search: Optional[str] = None,
+    user: dict = Depends(get_current_user)
+):
+    query = {"shop_id": user["shop_id"]}
+    
+    if search:
+        query["$or"] = [
+            {"name": {"$regex": search, "$options": "i"}},
+            {"phone": {"$regex": search, "$options": "i"}}
+        ]
+    
+    suppliers = await db.suppliers.find(query, {"_id": 0}).sort("name", 1).to_list(1000)
+    return [SupplierResponse(**s) for s in suppliers]
+
+@api_router.get("/suppliers/{supplier_id}", response_model=SupplierResponse)
+async def get_supplier(supplier_id: str, user: dict = Depends(get_current_user)):
+    supplier = await db.suppliers.find_one(
+        {"id": supplier_id, "shop_id": user["shop_id"]}, {"_id": 0}
+    )
+    if not supplier:
+        raise HTTPException(status_code=404, detail="Supplier not found")
+    return SupplierResponse(**supplier)
+
+@api_router.put("/suppliers/{supplier_id}", response_model=SupplierResponse)
+async def update_supplier(
+    supplier_id: str, 
+    data: SupplierUpdate, 
+    user: dict = Depends(require_owner)
+):
+    update_data = {k: v for k, v in data.model_dump().items() if v is not None}
+    
+    result = await db.suppliers.update_one(
+        {"id": supplier_id, "shop_id": user["shop_id"]},
+        {"$set": update_data}
+    )
+    
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Supplier not found")
+    
+    supplier = await db.suppliers.find_one({"id": supplier_id}, {"_id": 0})
+    return SupplierResponse(**supplier)
+
+@api_router.delete("/suppliers/{supplier_id}")
+async def delete_supplier(supplier_id: str, user: dict = Depends(require_owner)):
+    result = await db.suppliers.delete_one({"id": supplier_id, "shop_id": user["shop_id"]})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Supplier not found")
+    return {"message": "Supplier deleted"}
+
+# =============================================================================
+# PURCHASE ROUTES
+# =============================================================================
+
+@api_router.post("/purchases", response_model=PurchaseResponse)
+async def create_purchase(data: PurchaseCreate, user: dict = Depends(get_current_user)):
+    """Create a purchase order and update stock quantities"""
+    purchase_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    
+    # Get supplier info
+    supplier = await db.suppliers.find_one(
+        {"id": data.supplier_id, "shop_id": user["shop_id"]}, {"_id": 0}
+    )
+    if not supplier:
+        raise HTTPException(status_code=404, detail="Supplier not found")
+    
+    # Update stock for each item
+    for item in data.items:
+        product = await db.products.find_one(
+            {"id": item.product_id, "shop_id": user["shop_id"]}, {"_id": 0}
+        )
+        if not product:
+            raise HTTPException(status_code=404, detail=f"Product {item.product_id} not found")
+        
+        # Calculate total units to add based on unit type
+        total_units = item.quantity * item.units_per_package
+        
+        # Update product stock and cost price
+        cost_per_unit = item.cost / total_units if total_units > 0 else 0
+        await db.products.update_one(
+            {"id": item.product_id},
+            {
+                "$inc": {"stock_quantity": total_units},
+                "$set": {"cost_price": cost_per_unit, "updated_at": now}
+            }
+        )
+    
+    purchase = {
+        "id": purchase_id,
+        "purchase_number": generate_purchase_number(),
+        "supplier_id": data.supplier_id,
+        "supplier_name": supplier["name"],
+        "items": [item.model_dump() for item in data.items],
+        "total_cost": data.total_cost,
+        "notes": data.notes,
+        "shop_id": user["shop_id"],
+        "created_by": user["id"],
+        "created_at": now
+    }
+    
+    await db.purchases.insert_one(purchase)
+    return PurchaseResponse(**purchase)
+
+@api_router.get("/purchases", response_model=List[PurchaseResponse])
+async def list_purchases(
+    supplier_id: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    limit: int = 100,
+    user: dict = Depends(get_current_user)
+):
+    query = {"shop_id": user["shop_id"]}
+    
+    if supplier_id:
+        query["supplier_id"] = supplier_id
+    
+    if start_date:
+        query["created_at"] = {"$gte": start_date}
+    if end_date:
+        if "created_at" in query:
+            query["created_at"]["$lte"] = end_date
+        else:
+            query["created_at"] = {"$lte": end_date}
+    
+    purchases = await db.purchases.find(query, {"_id": 0}).sort("created_at", -1).to_list(limit)
+    return [PurchaseResponse(**p) for p in purchases]
+
+@api_router.get("/purchases/{purchase_id}", response_model=PurchaseResponse)
+async def get_purchase(purchase_id: str, user: dict = Depends(get_current_user)):
+    purchase = await db.purchases.find_one(
+        {"id": purchase_id, "shop_id": user["shop_id"]}, {"_id": 0}
+    )
+    if not purchase:
+        raise HTTPException(status_code=404, detail="Purchase not found")
+    return PurchaseResponse(**purchase)
+
+@api_router.delete("/purchases/{purchase_id}")
+async def delete_purchase(purchase_id: str, user: dict = Depends(require_owner)):
+    """Only owners can delete purchases"""
+    purchase = await db.purchases.find_one(
+        {"id": purchase_id, "shop_id": user["shop_id"]}, {"_id": 0}
+    )
+    if not purchase:
+        raise HTTPException(status_code=404, detail="Purchase not found")
+    
+    # Note: We don't reverse the stock changes when deleting
+    # This is intentional as the stock was already physically received
+    
+    result = await db.purchases.delete_one({"id": purchase_id})
+    return {"message": "Purchase record deleted"}
+
+@api_router.get("/purchases/stats/summary")
+async def get_purchases_summary(user: dict = Depends(get_current_user)):
+    """Get purchase statistics"""
+    shop_id = user["shop_id"]
+    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    # Today's purchases
+    today_purchases = await db.purchases.find(
+        {"shop_id": shop_id, "created_at": {"$gte": today.isoformat()}},
+        {"_id": 0}
+    ).to_list(1000)
+    
+    today_total = sum(p["total_cost"] for p in today_purchases)
+    
+    # Total suppliers
+    supplier_count = await db.suppliers.count_documents({"shop_id": shop_id})
+    
+    # This month's purchases
+    month_start = today.replace(day=1)
+    month_purchases = await db.purchases.find(
+        {"shop_id": shop_id, "created_at": {"$gte": month_start.isoformat()}},
+        {"_id": 0}
+    ).to_list(10000)
+    
+    month_total = sum(p["total_cost"] for p in month_purchases)
+    
+    return {
+        "today_purchases": len(today_purchases),
+        "today_total": today_total,
+        "month_total": month_total,
+        "supplier_count": supplier_count
+    }
+
+# =============================================================================
 # SHOP SETTINGS
 # =============================================================================
 
