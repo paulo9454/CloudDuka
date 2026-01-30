@@ -13,14 +13,14 @@ CloudDuka is a cloud-based, mobile-first POS system designed for retail shops in
 1. **Shop Owner** - Full system access including stock, users, reports, and settings
 2. **Shopkeeper** - Sales, M-Pesa payments, and credit sales only
 
-## Pricing Model
-- Monthly: KES 499
-- Annual: KES 5,000 (17% savings)
+## Pricing Model (Updated Jan 2025)
+- Monthly: KES 300
+- Annual: KES 3,000 (17% savings)
 - Free Trial: 14 Days
 
 ---
 
-## What's Been Implemented (January 2024)
+## What's Been Implemented
 
 ### Core Features
 - [x] JWT Authentication with Phone + PIN
@@ -28,7 +28,7 @@ CloudDuka is a cloud-based, mobile-first POS system designed for retail shops in
 - [x] Product/Stock Management (CRUD)
 - [x] POS System with Cart
 - [x] Three Payment Methods: Cash, M-Pesa (Mock), Credit
-- [x] Credit Customer Management
+- [x] Credit Customer Management (Persistent, System-wide)
 - [x] Damaged/Spoiled Stock Tracking
 - [x] Sales Reports with Date Range
 - [x] PDF Export (Sales, Credit, Damaged reports)
@@ -37,19 +37,42 @@ CloudDuka is a cloud-based, mobile-first POS system designed for retail shops in
 - [x] Basic Offline Support (localStorage caching)
 - [x] Mobile-first responsive design
 
+### Product Entry Features (Jan 2025)
+- [x] Unit types: Single, Packet, Dozen
+- [x] Auto-calculation of total stock units for Packet/Dozen purchases
+- [x] Auto-calculation of cost per unit
+- [x] Stock field locked when buying in bulk (Packet/Dozen)
+- [x] Optional free-text category with autocomplete
+
+### Credit Customer Features (Jan 2025)
+- [x] Persistent credit customers stored in MongoDB
+- [x] System-wide availability (Credit Page, POS dropdown)
+- [x] Balance tracking with automatic updates
+- [x] Transaction history (sales + payments)
+- [x] Credit limit management
+- [x] Payment recording with notes
+
+### Dashboard Features (Jan 2025)
+- [x] 4 main action buttons (New Sale, Credit Sale, Today's Sales, Stock)
+- [x] Today's Summary with Cash/M-Pesa/Credit breakdown
+- [x] Low Stock Alert section
+- [x] Total Sales Today
+- [x] Credit Outstanding display
+
 ### Technical Stack
 - **Backend:** FastAPI with MongoDB
 - **Frontend:** React with Tailwind CSS, shadcn/ui
 - **Auth:** JWT tokens
 - **State:** Zustand
 - **Charts:** Recharts
-- **PDF:** jspdf + jspdf-autotable
+- **PDF:** fpdf (backend), jspdf (frontend)
 
 ### API Endpoints
 - `/api/auth/*` - Register, Login, Profile
 - `/api/products/*` - CRUD operations
+- `/api/products/categories/list` - Simple category list
 - `/api/sales/*` - Create and list sales
-- `/api/credit-customers/*` - Customer management
+- `/api/credit-customers/*` - Customer management + history + payments
 - `/api/damaged-stock/*` - Track stock losses
 - `/api/reports/*` - Dashboard, sales, credit, damaged reports
 - `/api/mpesa/*` - Mock STK Push (simulation mode)
@@ -61,10 +84,13 @@ CloudDuka is a cloud-based, mobile-first POS system designed for retail shops in
 ## Prioritized Backlog
 
 ### P0 - Critical (Next Sprint)
+- [ ] **Bundle Pricing** - Add optional bundle pricing (e.g., 3 units for 50 KES) with bundle-only toggle
+- [ ] **DB-backed Categories** - Replace free-text with dropdown from database CRUD
 - [ ] Real M-Pesa Daraja API integration
-- [ ] Subscription/Payment processing for KES 499/5000
 
 ### P1 - High Priority
+- [ ] Multi-shop support (owner can manage multiple shops)
+- [ ] Add CloudDuka logo to dashboard header
 - [ ] Full offline mode with IndexedDB + background sync
 - [ ] Receipt printing support
 - [ ] Barcode scanning for products
@@ -73,7 +99,6 @@ CloudDuka is a cloud-based, mobile-first POS system designed for retail shops in
 ### P2 - Medium Priority
 - [ ] SMS notifications for credit customers
 - [ ] Inventory low stock auto-reorder alerts
-- [ ] Multi-shop support
 - [ ] Customer loyalty points
 
 ### P3 - Nice to Have
@@ -84,36 +109,17 @@ CloudDuka is a cloud-based, mobile-first POS system designed for retail shops in
 
 ---
 
-## Next Action Items
-1. Obtain M-Pesa Daraja API credentials for real integration
-2. Implement Stripe/PayPal for subscription payments
-3. Add IndexedDB for robust offline support
-4. Implement receipt thermal printer support
+## Mocked Integrations
+- **M-Pesa Daraja API**: Currently simulated with mock endpoints
+  - `/api/mpesa/stk-push` - Simulates STK Push request
+  - `/api/mpesa/confirm/{checkout_request_id}` - Simulates payment confirmation
 
 ---
 
-## Update: January 2024 - Category Management Feature
+## Test Credentials
+- **Phone:** 0712345678
+- **PIN:** 1234
 
-### Implemented
-- [x] Category CRUD for Owners (Create, Read, Update, Delete)
-- [x] Category assignment for products via dropdown
-- [x] Category filter chips on Products page
-- [x] Category-first selection in POS for faster product finding
-- [x] "Other" category for uncategorized products
-- [x] Color-coded category badges on products
-- [x] Back to categories navigation in POS
-- [x] "Show All" option to view all products
+---
 
-### API Endpoints Added
-- `POST /api/categories` - Create category (Owner only)
-- `GET /api/categories` - List all categories with product counts
-- `GET /api/categories/{id}` - Get single category
-- `PUT /api/categories/{id}` - Update category (Owner only)  
-- `DELETE /api/categories/{id}` - Delete category (Owner only)
-- `GET /api/categories/{id}/products` - Get products in category
-
-### Workflow
-1. Owner creates categories (Cigarettes, Snacks, Beverages, Household, etc.)
-2. Owner/Shopkeeper assigns products to categories when adding/editing
-3. Shopkeeper selects category first in POS → sees only products in that category
-4. Faster checkout, less scrolling, organized inventory
+## Last Updated: January 30, 2025
