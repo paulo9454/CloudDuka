@@ -12,7 +12,11 @@ import {
   Trash2,
   BarChart3,
   Settings,
-  WifiOff
+  WifiOff,
+  Truck,
+  ShoppingBag,
+  HelpCircle,
+  MessageSquare
 } from 'lucide-react';
 
 // Pages
@@ -25,6 +29,8 @@ import DamagedPage from './pages/DamagedPage';
 import ReportsPage from './pages/ReportsPage';
 import UsersPage from './pages/UsersPage';
 import SettingsPage from './pages/SettingsPage';
+import SuppliersPage from './pages/SuppliersPage';
+import PurchasesPage from './pages/PurchasesPage';
 
 // Protected Route Component
 const ProtectedRoute = ({ children }) => {
