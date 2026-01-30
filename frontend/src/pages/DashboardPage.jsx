@@ -1,22 +1,20 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { useAuthStore, api, formatCurrency, formatTime } from '../lib/store';
-import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
+import { useAuthStore, api, formatCurrency } from '../lib/store';
+import { Card, CardContent } from '../components/ui/card';
 import { Button } from '../components/ui/button';
 import { Skeleton } from '../components/ui/skeleton';
 import { 
-  LayoutDashboard, 
-  TrendingUp, 
-  Package, 
-  AlertTriangle, 
-  CreditCard,
-  ShoppingCart,
-  ArrowRight,
-  Wallet,
-  Smartphone,
-  Users
+  ShoppingCart, 
+  Users, 
+  BarChart3, 
+  Package,
+  AlertTriangle,
+  ChevronRight,
+  Cloud
 } from 'lucide-react';
-import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts';
+
+const LOGO_URL = 'https://customer-assets.emergentagent.com/job_983fa6fb-7b7a-442c-bfdf-c5926d9538b8/artifacts/uzuoo21v_CloudDuka%20Logo.jpeg';
 
 export default function DashboardPage() {
   const navigate = useNavigate();
@@ -39,281 +37,198 @@ export default function DashboardPage() {
     }
   };
 
-  const StatCard = ({ title, value, icon: Icon, color, onClick }) => (
-    <Card 
-      className={`cursor-pointer card-interactive ${onClick ? 'hover:border-[#007BFF]/50' : ''}`}
-      onClick={onClick}
-      data-testid={`stat-card-${title.toLowerCase().replace(/\s/g, '-')}`}
-    >
-      <CardContent className="p-4">
-        <div className="flex items-center justify-between">
-          <div>
-            <p className="text-sm text-slate-500">{title}</p>
-            <p className="text-2xl font-bold mt-1" style={{ fontFamily: 'Outfit, sans-serif' }}>
-              {value}
-            </p>
-          </div>
-          <div className={`p-3 rounded-xl ${color}`}>
-            <Icon className="h-6 w-6" />
-          </div>
-        </div>
-      </CardContent>
-    </Card>
-  );
+  // Calculate days remaining in trial
+  const getDaysRemaining = () => {
+    if (!user?.trial_ends_at) return 0;
+    const trialEnd = new Date(user.trial_ends_at);
+    const now = new Date();
+    const days = Math.ceil((trialEnd - now) / (1000 * 60 * 60 * 24));
+    return Math.max(0, days);
+  };
+
+  const daysRemaining = getDaysRemaining();
 
   if (loading) {
     return (
-      <div className="p-4 space-y-4" data-testid="dashboard-loading">
-        <Skeleton className="h-8 w-48" />
-        <div className="grid grid-cols-2 gap-4">
-          {[1, 2, 3, 4].map((i) => (
-            <Skeleton key={i} className="h-24 rounded-xl" />
-          ))}
+      <div className="min-h-screen bg-white" data-testid="dashboard-loading">
+        <div className="bg-[#007BFF] h-32" />
+        <div className="p-4 space-y-4">
+          <Skeleton className="h-24 rounded-xl" />
+          <div className="grid grid-cols-2 gap-4">
+            {[1, 2, 3, 4].map((i) => (
+              <Skeleton key={i} className="h-28 rounded-xl" />
+            ))}
+          </div>
+          <Skeleton className="h-32 rounded-xl" />
         </div>
-        <Skeleton className="h-48 rounded-xl" />
       </div>
     );
   }
 
   return (
-    <div className="p-4 space-y-6" data-testid="dashboard-page">
-      {/* Header */}
-      <div>
-        <h1 className="text-2xl font-bold text-slate-900" style={{ fontFamily: 'Outfit, sans-serif' }}>
-          Hello, {user?.name?.split(' ')[0] || 'there'}!
-        </h1>
-        <p className="text-slate-500 text-sm mt-1">Here's your shop overview for today</p>
+    <div className="min-h-screen bg-slate-100" data-testid="dashboard-page">
+      {/* Header with Logo */}
+      <div className="bg-[#007BFF] pt-4 pb-8 px-4">
+        <div className="flex items-center justify-center gap-2 mb-3">
+          <Cloud className="h-8 w-8 text-white" />
+          <h1 className="text-2xl font-bold text-white" style={{ fontFamily: 'Outfit, sans-serif' }}>
+            Cloud<span className="text-[#FF8C00]">Duka</span>
+          </h1>
+        </div>
+        
+        {/* Trial Banner */}
+        <div className="text-center">
+          <p className="text-white font-semibold text-lg">
+            Free Trial: {daysRemaining} Days Remaining
+          </p>
+        </div>
       </div>
 
-      {/* Stats Grid */}
-      <div className="grid grid-cols-2 gap-4">
-        <StatCard
-          title="Today's Sales"
-          value={formatCurrency(stats?.today?.total || 0)}
-          icon={TrendingUp}
-          color="bg-green-100 text-green-600"
-          onClick={() => navigate('/reports')}
-        />
-        <StatCard
-          title="Transactions"
-          value={stats?.today?.count || 0}
-          icon={ShoppingCart}
-          color="bg-blue-100 text-[#007BFF]"
-          onClick={() => navigate('/reports')}
-        />
-        <StatCard
-          title="Low Stock"
-          value={stats?.low_stock_count || 0}
-          icon={AlertTriangle}
-          color={stats?.low_stock_count > 0 ? "bg-amber-100 text-amber-600" : "bg-slate-100 text-slate-600"}
-          onClick={() => navigate('/products?filter=low-stock')}
-        />
-        <StatCard
-          title="Credit Due"
-          value={formatCurrency(stats?.total_credit_outstanding || 0)}
-          icon={CreditCard}
-          color="bg-orange-100 text-[#FF8C00]"
-          onClick={() => navigate('/credit')}
-        />
+      {/* Upgrade Banner */}
+      <div className="bg-slate-200 py-2 px-4 text-center border-b border-slate-300">
+        <p className="text-sm text-slate-700">
+          Upgrade to Full Version: <span className="font-semibold">KES 499 Monthly</span> or <span className="font-semibold">KES 5,000 Yearly</span>
+        </p>
       </div>
 
-      {/* Payment Methods Breakdown */}
-      <Card>
-        <CardHeader className="pb-2">
-          <CardTitle className="text-lg flex items-center gap-2">
-            <Wallet className="h-5 w-5 text-[#007BFF]" />
-            Today by Payment
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          <div className="flex items-center justify-between p-3 bg-green-50 rounded-xl">
-            <div className="flex items-center gap-3">
-              <div className="p-2 bg-green-100 rounded-lg">
-                <Wallet className="h-5 w-5 text-green-600" />
-              </div>
-              <span className="font-medium">Cash</span>
+      {/* Main Content */}
+      <div className="p-4 space-y-4 -mt-4">
+        {/* Action Buttons Grid */}
+        <div className="grid grid-cols-2 gap-4">
+          {/* New Sale */}
+          <button
+            onClick={() => navigate('/pos')}
+            className="bg-[#22C55E] hover:bg-[#16A34A] text-white rounded-2xl p-6 flex flex-col items-center justify-center gap-3 shadow-lg transition-all active:scale-95"
+            data-testid="btn-new-sale"
+          >
+            <div className="bg-white/20 p-3 rounded-xl">
+              <ShoppingCart className="h-8 w-8" />
             </div>
-            <span className="font-bold text-green-600">{formatCurrency(stats?.today?.cash || 0)}</span>
-          </div>
-          
-          <div className="flex items-center justify-between p-3 bg-emerald-50 rounded-xl">
-            <div className="flex items-center gap-3">
-              <div className="p-2 bg-emerald-100 rounded-lg">
-                <Smartphone className="h-5 w-5 text-emerald-600" />
-              </div>
-              <span className="font-medium">M-Pesa</span>
-            </div>
-            <span className="font-bold text-emerald-600">{formatCurrency(stats?.today?.mpesa || 0)}</span>
-          </div>
-          
-          <div className="flex items-center justify-between p-3 bg-orange-50 rounded-xl">
-            <div className="flex items-center gap-3">
-              <div className="p-2 bg-orange-100 rounded-lg">
-                <Users className="h-5 w-5 text-orange-600" />
-              </div>
-              <span className="font-medium">Credit</span>
-            </div>
-            <span className="font-bold text-orange-600">{formatCurrency(stats?.today?.credit || 0)}</span>
-          </div>
-        </CardContent>
-      </Card>
+            <span className="font-semibold text-lg">New Sale</span>
+          </button>
 
-      {/* Weekly Sales Chart */}
-      {stats?.weekly_sales && stats.weekly_sales.length > 0 && (
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-lg">Weekly Sales</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="h-48">
-              <ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={stats.weekly_sales}>
-                  <defs>
-                    <linearGradient id="salesGradient" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="#007BFF" stopOpacity={0.3} />
-                      <stop offset="95%" stopColor="#007BFF" stopOpacity={0} />
-                    </linearGradient>
-                  </defs>
-                  <XAxis 
-                    dataKey="date" 
-                    axisLine={false} 
-                    tickLine={false}
-                    tick={{ fontSize: 12, fill: '#64748b' }}
-                  />
-                  <YAxis 
-                    axisLine={false} 
-                    tickLine={false}
-                    tick={{ fontSize: 12, fill: '#64748b' }}
-                    tickFormatter={(v) => `${(v / 1000).toFixed(0)}K`}
-                  />
-                  <Tooltip 
-                    formatter={(value) => [formatCurrency(value), 'Sales']}
-                    contentStyle={{ 
-                      borderRadius: '12px', 
-                      border: 'none', 
-                      boxShadow: '0 4px 12px rgba(0,0,0,0.1)' 
-                    }}
-                  />
-                  <Area 
-                    type="monotone" 
-                    dataKey="sales" 
-                    stroke="#007BFF" 
-                    strokeWidth={2}
-                    fill="url(#salesGradient)" 
-                  />
-                </AreaChart>
-              </ResponsiveContainer>
+          {/* Credit Sale */}
+          <button
+            onClick={() => navigate('/credit')}
+            className="bg-[#FF8C00] hover:bg-[#E07B00] text-white rounded-2xl p-6 flex flex-col items-center justify-center gap-3 shadow-lg transition-all active:scale-95"
+            data-testid="btn-credit-sale"
+          >
+            <div className="bg-white/20 p-3 rounded-xl">
+              <Users className="h-8 w-8" />
+            </div>
+            <span className="font-semibold text-lg">Credit Sale</span>
+          </button>
+
+          {/* Today's Sales */}
+          <button
+            onClick={() => navigate('/reports')}
+            className="bg-[#3B82F6] hover:bg-[#2563EB] text-white rounded-2xl p-6 flex flex-col items-center justify-center gap-3 shadow-lg transition-all active:scale-95"
+            data-testid="btn-todays-sales"
+          >
+            <div className="bg-white/20 p-3 rounded-xl">
+              <BarChart3 className="h-8 w-8" />
+            </div>
+            <span className="font-semibold text-lg">Today's Sales</span>
+          </button>
+
+          {/* Stock */}
+          <button
+            onClick={() => navigate('/products')}
+            className="bg-[#8B5CF6] hover:bg-[#7C3AED] text-white rounded-2xl p-6 flex flex-col items-center justify-center gap-3 shadow-lg transition-all active:scale-95"
+            data-testid="btn-stock"
+          >
+            <div className="bg-white/20 p-3 rounded-xl">
+              <Package className="h-8 w-8" />
+            </div>
+            <span className="font-semibold text-lg">Stock</span>
+          </button>
+        </div>
+
+        {/* Today's Summary Card */}
+        <Card className="shadow-md">
+          <CardContent className="p-0">
+            <div 
+              className="flex items-center justify-between p-4 border-b cursor-pointer hover:bg-slate-50"
+              onClick={() => navigate('/reports')}
+            >
+              <h2 className="font-bold text-lg text-slate-800">Today's Summary</h2>
+              <ChevronRight className="h-5 w-5 text-slate-400" />
+            </div>
+            
+            <div className="grid grid-cols-3 divide-x">
+              <div className="p-4 text-center">
+                <p className="text-sm text-slate-500 font-medium">Cash</p>
+                <p className="text-lg font-bold text-slate-800">
+                  KES {(stats?.today?.cash || 0).toLocaleString()}
+                </p>
+              </div>
+              <div className="p-4 text-center">
+                <p className="text-sm text-slate-500 font-medium">M-Pesa</p>
+                <p className="text-lg font-bold text-slate-800">
+                  KES {(stats?.today?.mpesa || 0).toLocaleString()}
+                </p>
+              </div>
+              <div className="p-4 text-center">
+                <p className="text-sm text-slate-500 font-medium">Credit</p>
+                <p className="text-lg font-bold text-slate-800">
+                  KES {(stats?.today?.credit || 0).toLocaleString()}
+                </p>
+              </div>
             </div>
           </CardContent>
         </Card>
-      )}
 
-      {/* Low Stock Alert */}
-      {stats?.low_stock_items && stats.low_stock_items.length > 0 && (
-        <Card className="border-amber-200 bg-amber-50/50">
-          <CardHeader className="pb-2">
-            <CardTitle className="text-lg flex items-center gap-2 text-amber-700">
-              <AlertTriangle className="h-5 w-5" />
-              Low Stock Alert
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="space-y-2">
-              {stats.low_stock_items.slice(0, 3).map((item) => (
-                <div 
-                  key={item.id} 
-                  className="flex items-center justify-between p-3 bg-white rounded-lg"
-                >
-                  <div>
-                    <p className="font-medium">{item.name}</p>
-                    <p className="text-sm text-slate-500">{item.stock_quantity} left</p>
-                  </div>
-                  <span className="px-3 py-1 bg-amber-100 text-amber-700 rounded-full text-sm font-medium">
-                    Restock
-                  </span>
-                </div>
-              ))}
+        {/* Low Stock Alert Card */}
+        <Card className="shadow-md border-l-4 border-l-[#FF8C00]">
+          <CardContent className="p-4">
+            <div className="flex items-start gap-3">
+              <div className="bg-orange-100 p-2 rounded-lg">
+                <AlertTriangle className="h-6 w-6 text-[#FF8C00]" />
+              </div>
+              <div className="flex-1">
+                <h3 className="font-bold text-[#FF8C00] text-lg">Low Stock Alert!</h3>
+                <p className="text-slate-600 mt-1">
+                  {stats?.low_stock_count || 0} Item{(stats?.low_stock_count || 0) !== 1 ? 's' : ''} running low!
+                </p>
+              </div>
             </div>
+            
             <Button 
-              variant="ghost" 
-              className="w-full mt-3 text-amber-700"
+              className="w-full mt-4 bg-[#FF8C00] hover:bg-[#E07B00] text-white rounded-full h-12 font-semibold"
               onClick={() => navigate('/products?filter=low-stock')}
-              data-testid="view-all-low-stock-btn"
+              data-testid="btn-view-stock"
             >
-              View All <ArrowRight className="ml-2 h-4 w-4" />
+              View Stock
             </Button>
           </CardContent>
         </Card>
-      )}
 
-      {/* Recent Transactions */}
-      <Card>
-        <CardHeader className="pb-2">
-          <CardTitle className="text-lg">Recent Sales</CardTitle>
-        </CardHeader>
-        <CardContent>
-          {stats?.recent_sales && stats.recent_sales.length > 0 ? (
-            <div className="space-y-3">
-              {stats.recent_sales.slice(0, 5).map((sale) => (
-                <div 
-                  key={sale.id} 
-                  className="flex items-center justify-between p-3 bg-slate-50 rounded-xl"
-                  data-testid={`recent-sale-${sale.id}`}
-                >
-                  <div>
-                    <p className="font-medium">{sale.receipt_number}</p>
-                    <p className="text-sm text-slate-500">
-                      {formatTime(sale.created_at)} • {sale.items.length} items
-                    </p>
-                  </div>
-                  <div className="text-right">
-                    <p className="font-bold">{formatCurrency(sale.total_amount)}</p>
-                    <span className={`text-xs px-2 py-0.5 rounded-full ${
-                      sale.payment_method === 'cash' ? 'bg-green-100 text-green-700' :
-                      sale.payment_method === 'mpesa' ? 'bg-emerald-100 text-emerald-700' :
-                      'bg-orange-100 text-orange-700'
-                    }`}>
-                      {sale.payment_method.toUpperCase()}
-                    </span>
-                  </div>
-                </div>
-              ))}
-            </div>
-          ) : (
-            <div className="text-center py-8 text-slate-500">
-              <ShoppingCart className="h-12 w-12 mx-auto mb-2 opacity-30" />
-              <p>No sales today yet</p>
-              <Button 
-                className="mt-4 bg-[#007BFF]"
-                onClick={() => navigate('/pos')}
-                data-testid="start-selling-btn"
-              >
-                Start Selling
-              </Button>
-            </div>
-          )}
-        </CardContent>
-      </Card>
-
-      {/* Quick Actions */}
-      <div className="grid grid-cols-2 gap-4">
-        <Button 
-          className="h-14 bg-[#007BFF] hover:bg-[#0069D9] rounded-xl"
-          onClick={() => navigate('/pos')}
-          data-testid="quick-new-sale-btn"
-        >
-          <ShoppingCart className="mr-2 h-5 w-5" />
-          New Sale
-        </Button>
-        <Button 
-          variant="outline"
-          className="h-14 border-2 rounded-xl"
-          onClick={() => navigate('/products')}
-          data-testid="quick-products-btn"
-        >
-          <Package className="mr-2 h-5 w-5" />
-          Products
-        </Button>
+        {/* Quick Stats */}
+        <div className="grid grid-cols-2 gap-4">
+          <Card className="shadow-md">
+            <CardContent className="p-4 text-center">
+              <p className="text-sm text-slate-500">Total Sales Today</p>
+              <p className="text-2xl font-bold text-[#007BFF]" style={{ fontFamily: 'Outfit, sans-serif' }}>
+                {formatCurrency(stats?.today?.total || 0)}
+              </p>
+              <p className="text-xs text-slate-400 mt-1">
+                {stats?.today?.count || 0} transactions
+              </p>
+            </CardContent>
+          </Card>
+          
+          <Card className="shadow-md">
+            <CardContent className="p-4 text-center">
+              <p className="text-sm text-slate-500">Credit Outstanding</p>
+              <p className="text-2xl font-bold text-[#FF8C00]" style={{ fontFamily: 'Outfit, sans-serif' }}>
+                {formatCurrency(stats?.total_credit_outstanding || 0)}
+              </p>
+              <p className="text-xs text-slate-400 mt-1">
+                from credit sales
+              </p>
+            </CardContent>
+          </Card>
+        </div>
       </div>
     </div>
   );
