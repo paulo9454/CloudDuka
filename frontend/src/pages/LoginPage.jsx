@@ -265,7 +265,7 @@ export default function LoginPage() {
 
         {/* Footer */}
         <div className="text-center mt-6 text-sm text-slate-500">
-          <p>Pricing: KES 499/month or KES 5,000/year</p>
+          <p>Pricing: KES 300/month or KES 3,000/year</p>
           <p className="mt-1">By Mosetech Solution</p>
         </div>
       </div>
