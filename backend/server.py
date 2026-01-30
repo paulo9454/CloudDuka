@@ -206,6 +206,54 @@ class MpesaSTKResponse(BaseModel):
     response_description: str
     customer_message: str
 
+# Supplier Models
+class SupplierCreate(BaseModel):
+    name: str
+    phone: str
+    notes: Optional[str] = None
+
+class SupplierUpdate(BaseModel):
+    name: Optional[str] = None
+    phone: Optional[str] = None
+    notes: Optional[str] = None
+
+class SupplierResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str
+    name: str
+    phone: str
+    notes: Optional[str] = None
+    shop_id: str
+    created_at: str
+
+# Purchase Models
+class PurchaseItem(BaseModel):
+    product_id: str
+    product_name: str
+    quantity: int
+    unit_type: str  # units, packets, dozens, boxes
+    units_per_package: int = 1  # How many units per packet/dozen/box
+    cost: float
+
+class PurchaseCreate(BaseModel):
+    supplier_id: str
+    items: List[PurchaseItem]
+    total_cost: float
+    notes: Optional[str] = None
+
+class PurchaseResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str
+    purchase_number: str
+    supplier_id: str
+    supplier_name: str
+    items: List[PurchaseItem]
+    total_cost: float
+    notes: Optional[str] = None
+    shop_id: str
+    created_by: str
+    created_at: str
+
 # =============================================================================
 # HELPER FUNCTIONS
 # =============================================================================
