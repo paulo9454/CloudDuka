@@ -14,8 +14,6 @@ import {
   Cloud
 } from 'lucide-react';
 
-const LOGO_URL = 'https://customer-assets.emergentagent.com/job_983fa6fb-7b7a-442c-bfdf-c5926d9538b8/artifacts/uzuoo21v_CloudDuka%20Logo.jpeg';
-
 export default function DashboardPage() {
   const navigate = useNavigate();
   const { user } = useAuthStore();
@@ -229,6 +227,32 @@ export default function DashboardPage() {
             </CardContent>
           </Card>
         </div>
+
+        <Card className="shadow-md">
+          <CardContent className="p-4 space-y-3">
+            <div className="flex items-center justify-between">
+              <h3 className="font-bold text-slate-800">Restock Suggestions</h3>
+              <Button variant="ghost" className="text-[#007BFF]" onClick={() => navigate('/purchases')}>
+                Order stock
+              </Button>
+            </div>
+            {(stats?.restock_suggestions || []).slice(0, 3).map((item) => (
+              <div key={item.product_id} className="rounded-xl bg-slate-50 px-3 py-2 flex items-center justify-between gap-3">
+                <div>
+                  <p className="font-medium text-slate-800">{item.product_name}</p>
+                  <p className="text-xs text-slate-500">Stock {item.stock_quantity} / Min {item.min_stock_level}</p>
+                </div>
+                <div className="text-right">
+                  <p className="text-sm font-semibold text-[#FF8C00]">Restock {item.recommended_restock}</p>
+                  <p className="text-xs text-slate-500">{formatCurrency(item.estimated_restock_cost || 0)}</p>
+                </div>
+              </div>
+            ))}
+            {(stats?.restock_suggestions || []).length === 0 ? (
+              <p className="text-sm text-slate-500">No urgent restocks today.</p>
+            ) : null}
+          </CardContent>
+        </Card>
       </div>
     </div>
   );

@@ -1,36 +1,46 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, Response
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, Response, Header, UploadFile, File, Query, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
-import os
 import logging
 from pathlib import Path
-from pydantic import BaseModel, Field, ConfigDict
-from typing import List, Optional
+from pydantic import BaseModel, Field, ConfigDict, EmailStr
+from typing import List, Optional, Literal
 import uuid
 from datetime import datetime, timezone, timedelta
 import jwt
 import bcrypt
+import asyncio
+import smtplib
+import ssl
 from io import BytesIO
+from email.message import EmailMessage
 from fpdf import FPDF
 import base64
+import os
+from uuid import uuid4
+
+from backend.config import settings
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
 # MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+client = AsyncIOMotorClient(settings.mongo_url)
+db = client[settings.db_name]
 
 # JWT Configuration
-JWT_SECRET = os.environ.get('JWT_SECRET', 'cloudduka-secret-key-2024')
-JWT_ALGORITHM = "HS256"
-JWT_EXPIRATION_HOURS = 24
+JWT_SECRET = settings.jwt_secret
+JWT_ALGORITHM = settings.jwt_algorithm
+JWT_EXPIRATION_HOURS = settings.jwt_expiration_hours
+REFRESH_TOKEN_EXPIRATION_DAYS = settings.refresh_token_expiration_days
+EMAIL_VERIFICATION_EXPIRATION_HOURS = settings.email_verification_expiration_hours
+MEDIA_PATH = settings.media_path
+MEDIA_PATH.mkdir(parents=True, exist_ok=True)
 
 # Create the main app
-app = FastAPI(title="CloudDuka POS API")
+app = FastAPI(title=settings.app_name)
 api_router = APIRouter(prefix="/api")
 security = HTTPBearer()
 
@@ -46,12 +56,26 @@ class UserCreate(BaseModel):
     phone: str
     pin: str
     name: str
+    email: Optional[EmailStr] = None
     role: str = "shopkeeper"  # owner or shopkeeper
     shop_name: Optional[str] = None
 
 class UserLogin(BaseModel):
     phone: str
     pin: str
+
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str
+
+class EmailVerificationRequest(BaseModel):
+    token: str
+
+class PasswordResetRequest(BaseModel):
+    email: EmailStr
+
+class PasswordResetConfirm(BaseModel):
+    token: str
+    new_pin: str = Field(min_length=4, max_length=10)
 
 class UserResponse(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -60,6 +84,8 @@ class UserResponse(BaseModel):
     name: str
     role: str
     shop_id: str
+    email: Optional[EmailStr] = None
+    email_verified: bool = False
     trial_ends_at: Optional[str] = None
     subscription_status: str = "trial"
     created_at: str
@@ -92,6 +118,7 @@ class ProductUpdate(BaseModel):
     bundle_units: Optional[int] = None
     bundle_price: Optional[float] = None
     bundle_only: Optional[bool] = None
+    image_url: Optional[str] = None
 
 class ProductResponse(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -108,7 +135,69 @@ class ProductResponse(BaseModel):
     bundle_units: Optional[int] = None
     bundle_price: Optional[float] = None
     bundle_only: bool = False
+    image_url: Optional[str] = None
     shop_id: str
+    created_at: str
+    updated_at: str
+
+class CartItem(BaseModel):
+    product_id: str
+    quantity: int = Field(gt=0)
+
+class CartItemResponse(BaseModel):
+    product_id: str
+    product_name: str
+    quantity: int
+    unit_price: float
+    total: float
+    image_url: Optional[str] = None
+
+class CartResponse(BaseModel):
+    id: str
+    shop_id: str
+    user_id: str
+    items: List[CartItemResponse]
+    total_items: int
+    total_amount: float
+    updated_at: str
+
+class CheckoutRequest(BaseModel):
+    payment_method: Literal["cash", "mpesa", "card"]
+    customer_name: Optional[str] = None
+    customer_email: Optional[EmailStr] = None
+    customer_phone: Optional[str] = None
+    shipping_address: Optional[str] = None
+    notes: Optional[str] = None
+
+class OrderStatusUpdate(BaseModel):
+    status: Literal["pending", "paid", "processing", "shipped", "completed", "cancelled"]
+
+class OrderItemResponse(BaseModel):
+    product_id: str
+    product_name: str
+    quantity: int
+    unit_price: float
+    total: float
+    image_url: Optional[str] = None
+
+class OrderResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str
+    order_number: str
+    shop_id: str
+    customer_name: Optional[str] = None
+    customer_email: Optional[EmailStr] = None
+    customer_phone: Optional[str] = None
+    shipping_address: Optional[str] = None
+    notes: Optional[str] = None
+    items: List[OrderItemResponse]
+    total_amount: float
+    payment_method: str
+    payment_status: str
+    status: str
+    mpesa_checkout_request_id: Optional[str] = None
+    mpesa_receipt: Optional[str] = None
+    created_by: str
     created_at: str
     updated_at: str
 
@@ -226,6 +315,12 @@ class SupplierResponse(BaseModel):
     shop_id: str
     created_at: str
 
+class ShopCreate(BaseModel):
+    name: str
+    address: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[EmailStr] = None
+
 # Purchase Models
 class PurchaseItem(BaseModel):
     product_id: str
@@ -254,6 +349,22 @@ class PurchaseResponse(BaseModel):
     created_by: str
     created_at: str
 
+class MarketplaceOrderItem(BaseModel):
+    product_id: str
+    product_name: str
+    quantity: int = Field(gt=0)
+    unit_cost: float = Field(gt=0)
+
+class MarketplaceOrderCreate(BaseModel):
+    vendor_id: str
+    items: List[MarketplaceOrderItem]
+    payment_method: Literal["mpesa", "paystack", "bank_transfer", "cash"] = "mpesa"
+    notes: Optional[str] = None
+
+class MarketplaceDeliveryUpdate(BaseModel):
+    status: Literal["delivered", "cancelled"]
+    notes: Optional[str] = None
+
 # =============================================================================
 # HELPER FUNCTIONS
 # =============================================================================
@@ -273,14 +384,284 @@ def create_token(user_id: str, shop_id: str, role: str) -> str:
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
-async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+def create_refresh_token(user_id: str) -> str:
+    payload = {
+        "user_id": user_id,
+        "type": "refresh",
+        "exp": datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRATION_DAYS)
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+def create_email_verification_token(user_id: str) -> str:
+    payload = {
+        "user_id": user_id,
+        "type": "email_verification",
+        "exp": datetime.now(timezone.utc) + timedelta(hours=EMAIL_VERIFICATION_EXPIRATION_HOURS)
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+def create_password_reset_token(user_id: str) -> str:
+    payload = {
+        "user_id": user_id,
+        "type": "password_reset",
+        "exp": datetime.now(timezone.utc) + timedelta(hours=1)
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+def build_media_url(filename: str) -> str:
+    if settings.media_base_url:
+        return f"{settings.media_base_url}/{filename}"
+    if settings.public_base_url:
+        return f"{settings.public_base_url}/api/uploads/{filename}"
+    return f"/api/uploads/{filename}"
+
+def generate_order_number():
+    return f"ORD-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{str(uuid.uuid4())[:4].upper()}"
+
+async def create_notification(
+    *,
+    user_id: str,
+    shop_id: str,
+    title: str,
+    message: str,
+    channel: str = "email",
+    metadata: Optional[dict] = None
+):
+    notification = {
+        "id": str(uuid4()),
+        "user_id": user_id,
+        "shop_id": shop_id,
+        "title": title,
+        "message": message,
+        "channel": channel,
+        "metadata": metadata or {},
+        "sent_at": datetime.now(timezone.utc).isoformat(),
+        "status": "logged" if settings.smtp_enabled else "queued"
+    }
+    await db.notifications.insert_one(notification)
+    return notification
+
+def build_restock_suggestions(products: List[dict]) -> List[dict]:
+    """
+    Convert raw inventory rows into actionable restock suggestions.
+    The score intentionally weighs shortage depth and stock-cover ratio so the
+    dashboards can sort the most urgent items first without extra client logic.
+    """
+    suggestions = []
+    for product in products:
+        min_level = max(product.get("min_stock_level", 0), 0)
+        stock = max(product.get("stock_quantity", 0), 0)
+        if stock > min_level:
+            continue
+
+        shortage = max(min_level - stock, 0)
+        recommended_restock = max(shortage, min_level or 1)
+        coverage_ratio = 1 if min_level == 0 else round(stock / min_level, 2)
+        urgency_score = (shortage * 2) + (0 if coverage_ratio >= 1 else round((1 - coverage_ratio) * 10, 2))
+        suggestions.append({
+            "product_id": product["id"],
+            "product_name": product["name"],
+            "sku": product.get("sku"),
+            "category": product.get("category"),
+            "stock_quantity": stock,
+            "min_stock_level": min_level,
+            "recommended_restock": recommended_restock,
+            "estimated_restock_cost": round((product.get("cost_price") or 0) * recommended_restock, 2),
+            "coverage_ratio": coverage_ratio,
+            "urgency_score": urgency_score,
+        })
+
+    return sorted(suggestions, key=lambda item: (-item["urgency_score"], item["product_name"]))
+
+async def get_shop_low_stock_products(shop_id: str) -> List[dict]:
+    products = await db.products.find({"shop_id": shop_id}, {"_id": 0}).to_list(1000)
+    return build_restock_suggestions(products)
+
+def summarize_payment_mix(payments: List[dict]) -> dict:
+    summary = {
+        "total_collected": 0.0,
+        "pending_amount": 0.0,
+        "successful_count": 0,
+        "pending_count": 0,
+        "failed_count": 0,
+        "by_method": {},
+    }
+    for payment in payments:
+        method = payment.get("method") or payment.get("provider") or "unknown"
+        bucket = summary["by_method"].setdefault(method, {"amount": 0.0, "count": 0})
+        bucket["amount"] += payment.get("amount", 0.0)
+        bucket["count"] += 1
+        status_value = payment.get("status")
+        if status_value in {"successful", "paid"}:
+            summary["total_collected"] += payment.get("amount", 0.0)
+            summary["successful_count"] += 1
+        elif status_value == "pending":
+            summary["pending_amount"] += payment.get("amount", 0.0)
+            summary["pending_count"] += 1
+        elif status_value:
+            summary["failed_count"] += 1
+    return summary
+
+async def send_email_message(*, to_email: str, subject: str, body: str):
+    if not settings.smtp_enabled:
+        logger.info("SMTP disabled; email queued for %s with subject %s", to_email, subject)
+        return {"status": "queued", "provider": "smtp-disabled"}
+
+    if not settings.smtp_host or not settings.smtp_username or not settings.smtp_password:
+        raise HTTPException(status_code=500, detail="SMTP is enabled but credentials are incomplete")
+
+    message = EmailMessage()
+    message["From"] = settings.smtp_from_email
+    message["To"] = to_email
+    message["Subject"] = subject
+    message.set_content(body)
+
+    def _send():
+        if settings.smtp_use_ssl:
+            with smtplib.SMTP_SSL(settings.smtp_host, settings.smtp_port, context=ssl.create_default_context()) as server:
+                server.login(settings.smtp_username, settings.smtp_password)
+                server.send_message(message)
+            return
+
+        with smtplib.SMTP(settings.smtp_host, settings.smtp_port) as server:
+            if settings.smtp_use_tls:
+                server.starttls(context=ssl.create_default_context())
+            server.login(settings.smtp_username, settings.smtp_password)
+            server.send_message(message)
+
+    await asyncio.to_thread(_send)
+    return {"status": "sent", "provider": "smtp"}
+
+async def send_transactional_email(
+    *,
+    user_id: str,
+    shop_id: str,
+    to_email: str,
+    subject: str,
+    body: str,
+    notification_title: str,
+    metadata: Optional[dict] = None
+):
+    send_result = await send_email_message(to_email=to_email, subject=subject, body=body)
+    notification = await create_notification(
+        user_id=user_id,
+        shop_id=shop_id,
+        title=notification_title,
+        message=body,
+        metadata={**(metadata or {}), **send_result}
+    )
+    await db.notifications.update_one(
+        {"id": notification["id"]},
+        {"$set": {"status": send_result["status"], "provider": send_result["provider"]}}
+    )
+    return send_result
+
+async def build_cart_response(user: dict) -> CartResponse:
+    cart = await db.cart.find_one({"user_id": user["id"], "shop_id": user["shop_id"]}, {"_id": 0})
+    items = cart.get("items", []) if cart else []
+    response_items: List[CartItemResponse] = []
+    total_amount = 0.0
+    total_items = 0
+
+    for item in items:
+        product = await db.products.find_one({"id": item["product_id"], "shop_id": user["shop_id"]}, {"_id": 0})
+        if not product:
+            continue
+
+        total = product["unit_price"] * item["quantity"]
+        total_amount += total
+        total_items += item["quantity"]
+        response_items.append(
+            CartItemResponse(
+                product_id=product["id"],
+                product_name=product["name"],
+                quantity=item["quantity"],
+                unit_price=product["unit_price"],
+                total=total,
+                image_url=product.get("image_url")
+            )
+        )
+
+    return CartResponse(
+        id=cart["id"] if cart else str(uuid4()),
+        shop_id=user["shop_id"],
+        user_id=user["id"],
+        items=response_items,
+        total_items=total_items,
+        total_amount=total_amount,
+        updated_at=cart["updated_at"] if cart else datetime.now(timezone.utc).isoformat()
+    )
+
+async def get_default_membership(user_id: str):
+    membership = await db.shop_users.find_one({"user_id": user_id}, {"_id": 0})
+    if membership:
+        return membership
+    return None
+
+async def resolve_shop_membership(user_id: str, requested_shop_id: Optional[str] = None) -> dict:
+    membership = None
+    if requested_shop_id:
+        membership = await db.shop_users.find_one({"user_id": user_id, "shop_id": requested_shop_id}, {"_id": 0})
+    else:
+        membership = await get_default_membership(user_id)
+
+    if not membership:
+        raise HTTPException(status_code=403, detail="You do not have access to this shop")
+
+    return membership
+
+async def get_active_subscription(shop_id: str):
+    return await db.subscriptions.find_one({"shop_id": shop_id}, {"_id": 0}, sort=[("expires_at", -1)])
+
+async def ensure_shop_subscription_active(shop_id: str):
+    subscription = await get_active_subscription(shop_id)
+    if not subscription:
+        raise HTTPException(status_code=403, detail="Shop subscription is inactive")
+
+    expires_at = datetime.fromisoformat(subscription["expires_at"])
+    if subscription.get("status") != "active" or expires_at <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=403, detail="Shop subscription is inactive")
+    return subscription
+
+async def run_transaction(operation):
+    try:
+        async with await client.start_session() as session:
+            async with session.start_transaction():
+                return await operation(session)
+    except Exception:
+        return await operation(None)
+
+async def get_current_user(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    x_shop_id: Optional[str] = Header(default=None, alias="X-Shop-Id")
+):
     try:
         token = credentials.credentials
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         user = await db.users.find_one({"id": payload["user_id"]}, {"_id": 0})
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
-        return user
+
+        membership = await resolve_shop_membership(user["id"], x_shop_id or payload.get("shop_id") or user.get("default_shop_id"))
+        exempt_paths = {
+            "/api/health",
+            "/api/auth/me",
+            "/api/subscriptions/current",
+            "/api/subscriptions/pay",
+        }
+        if request.url.path not in exempt_paths and not request.url.path.startswith("/api/mpesa/webhook"):
+            await ensure_shop_subscription_active(membership["shop_id"])
+
+        return {
+            **user,
+            "user_id": user["id"],
+            "id": user["id"],
+            "role": membership["role"],
+            "shop_id": membership["shop_id"],
+            "shop_user_id": membership["id"],
+            "primary_shop_id": user.get("default_shop_id") or membership["shop_id"]
+        }
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
     except jwt.InvalidTokenError:
@@ -306,6 +687,9 @@ def generate_purchase_number():
 
 @api_router.post("/auth/register", response_model=dict)
 async def register(data: UserCreate):
+    if data.role != "owner":
+        raise HTTPException(status_code=400, detail="Only owner registration is allowed on this endpoint")
+
     # Check if phone already exists
     existing = await db.users.find_one({"phone": data.phone})
     if existing:
@@ -329,10 +713,10 @@ async def register(data: UserCreate):
         "phone": data.phone,
         "pin_hash": hash_pin(data.pin),
         "name": data.name,
-        "role": data.role,
-        "shop_id": shop_id,
+        "email": data.email,
+        "email_verified": False,
+        "default_shop_id": shop_id,
         "trial_ends_at": (datetime.now(timezone.utc) + timedelta(days=14)).isoformat(),
-        "subscription_status": "trial",
         "created_at": datetime.now(timezone.utc).isoformat()
     }
     
@@ -341,18 +725,57 @@ async def register(data: UserCreate):
         await db.shops.update_one({"id": shop_id}, {"$set": {"owner_id": user_id}})
     
     await db.users.insert_one(user)
-    token = create_token(user_id, shop_id, data.role)
+    await db.shop_users.insert_one({
+        "id": str(uuid4()),
+        "user_id": user_id,
+        "shop_id": shop_id,
+        "role": "owner",
+        "created_at": datetime.now(timezone.utc).isoformat()
+    })
+    await db.subscriptions.insert_one({
+        "id": str(uuid4()),
+        "shop_id": shop_id,
+        "owner_id": user_id,
+        "amount": 300,
+        "status": "active",
+        "paid_at": datetime.now(timezone.utc).isoformat(),
+        "expires_at": (datetime.now(timezone.utc) + timedelta(days=14)).isoformat(),
+        "mpesa_receipt": "TRIAL"
+    })
+
+    token = create_token(user_id, shop_id, "owner")
+    refresh_token = create_refresh_token(user_id)
+    email_verification_token = create_email_verification_token(user_id) if data.email else None
+
+    if data.email:
+        await send_transactional_email(
+            user_id=user_id,
+            shop_id=shop_id,
+            to_email=data.email,
+            subject="Verify your CloudDuka account",
+            body=(
+                f"Hello {data.name},\n\n"
+                f"Use this verification token to verify your CloudDuka account:\n\n{email_verification_token}\n\n"
+                "If you did not create this account, please ignore this email."
+            ),
+            notification_title="Verify your email",
+            metadata={"verification_token": email_verification_token}
+        )
     
     return {
         "token": token,
+        "refresh_token": refresh_token,
+        "email_verification_token": email_verification_token,
         "user": {
             "id": user_id,
             "phone": data.phone,
             "name": data.name,
-            "role": data.role,
+            "email": data.email,
+            "email_verified": False,
+            "role": "owner",
             "shop_id": shop_id,
             "trial_ends_at": user["trial_ends_at"],
-            "subscription_status": user["subscription_status"],
+            "subscription_status": "active",
             "created_at": user["created_at"]
         }
     }
@@ -366,18 +789,27 @@ async def login(data: UserLogin):
     if not verify_pin(data.pin, user["pin_hash"]):
         raise HTTPException(status_code=401, detail="Invalid phone or PIN")
     
-    token = create_token(user["id"], user["shop_id"], user["role"])
+    membership = await get_default_membership(user["id"])
+    if not membership:
+        raise HTTPException(status_code=403, detail="User is not linked to any shop")
+
+    subscription = await get_active_subscription(membership["shop_id"])
+    token = create_token(user["id"], membership["shop_id"], membership["role"])
+    refresh_token = create_refresh_token(user["id"])
     
     return {
         "token": token,
+        "refresh_token": refresh_token,
         "user": {
             "id": user["id"],
             "phone": user["phone"],
             "name": user["name"],
-            "role": user["role"],
-            "shop_id": user["shop_id"],
+            "email": user.get("email"),
+            "email_verified": user.get("email_verified", False),
+            "role": membership["role"],
+            "shop_id": membership["shop_id"],
             "trial_ends_at": user.get("trial_ends_at"),
-            "subscription_status": user.get("subscription_status", "trial"),
+            "subscription_status": subscription.get("status", "expired") if subscription else "expired",
             "created_at": user["created_at"]
         }
     }
@@ -388,6 +820,8 @@ async def get_me(user: dict = Depends(get_current_user)):
         id=user["id"],
         phone=user["phone"],
         name=user["name"],
+        email=user.get("email"),
+        email_verified=user.get("email_verified", False),
         role=user["role"],
         shop_id=user["shop_id"],
         trial_ends_at=user.get("trial_ends_at"),
@@ -395,12 +829,104 @@ async def get_me(user: dict = Depends(get_current_user)):
         created_at=user["created_at"]
     )
 
+@api_router.post("/auth/refresh", response_model=dict)
+async def refresh_access_token(data: RefreshTokenRequest):
+    try:
+        payload = jwt.decode(data.refresh_token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        if payload.get("type") != "refresh":
+            raise HTTPException(status_code=401, detail="Invalid refresh token")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+
+    user = await db.users.find_one({"id": payload["user_id"]}, {"_id": 0})
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    membership = await get_default_membership(user["id"])
+    if not membership:
+        raise HTTPException(status_code=403, detail="User is not linked to any shop")
+    subscription = await get_active_subscription(membership["shop_id"])
+
+    return {
+        "token": create_token(user["id"], membership["shop_id"], membership["role"]),
+        "refresh_token": create_refresh_token(user["id"]),
+        "user": {
+            "id": user["id"],
+            "phone": user["phone"],
+            "name": user["name"],
+            "email": user.get("email"),
+            "email_verified": user.get("email_verified", False),
+            "role": membership["role"],
+            "shop_id": membership["shop_id"],
+            "trial_ends_at": user.get("trial_ends_at"),
+            "subscription_status": subscription.get("status", "expired") if subscription else "expired",
+            "created_at": user["created_at"]
+        }
+    }
+
+@api_router.post("/auth/verify-email", response_model=dict)
+async def verify_email(data: EmailVerificationRequest):
+    try:
+        payload = jwt.decode(data.token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        if payload.get("type") != "email_verification":
+            raise HTTPException(status_code=400, detail="Invalid verification token")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=400, detail="Invalid verification token")
+
+    result = await db.users.update_one(
+        {"id": payload["user_id"]},
+        {"$set": {"email_verified": True, "email_verified_at": datetime.now(timezone.utc).isoformat()}}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return {"message": "Email verified successfully"}
+
+@api_router.post("/auth/request-password-reset", response_model=dict)
+async def request_password_reset(data: PasswordResetRequest):
+    user = await db.users.find_one({"email": data.email}, {"_id": 0})
+    if not user:
+        return {"message": "If the email exists, a reset email has been sent"}
+
+    reset_token = create_password_reset_token(user["id"])
+    await send_transactional_email(
+        user_id=user["id"],
+        shop_id=user["shop_id"],
+        to_email=data.email,
+        subject="Reset your CloudDuka PIN",
+        body=(
+            f"Hello {user['name']},\n\n"
+            f"Use this password reset token to set a new PIN:\n\n{reset_token}\n\n"
+            "This token expires in 1 hour."
+        ),
+        notification_title="Password reset requested",
+        metadata={"password_reset_token": reset_token}
+    )
+    return {"message": "If the email exists, a reset email has been sent"}
+
+@api_router.post("/auth/reset-password", response_model=dict)
+async def reset_password(data: PasswordResetConfirm):
+    try:
+        payload = jwt.decode(data.token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        if payload.get("type") != "password_reset":
+            raise HTTPException(status_code=400, detail="Invalid reset token")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=400, detail="Invalid reset token")
+
+    result = await db.users.update_one(
+        {"id": payload["user_id"]},
+        {"$set": {"pin_hash": hash_pin(data.new_pin), "updated_at": datetime.now(timezone.utc).isoformat()}}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return {"message": "PIN reset successfully"}
+
 # =============================================================================
 # PRODUCT ROUTES
 # =============================================================================
 
 @api_router.post("/products", response_model=ProductResponse)
-async def create_product(data: ProductCreate, user: dict = Depends(get_current_user)):
+async def create_product(data: ProductCreate, user: dict = Depends(require_owner)):
     product_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
     
@@ -414,6 +940,7 @@ async def create_product(data: ProductCreate, user: dict = Depends(get_current_u
         "stock_quantity": data.stock_quantity,
         "min_stock_level": data.min_stock_level,
         "unit": data.unit,
+        "image_url": None,
         "shop_id": user["shop_id"],
         "created_at": now,
         "updated_at": now
@@ -427,6 +954,11 @@ async def list_products(
     search: Optional[str] = None,
     category: Optional[str] = None,
     low_stock: Optional[bool] = None,
+    min_price: Optional[float] = None,
+    max_price: Optional[float] = None,
+    in_stock: Optional[bool] = None,
+    sort_by: Optional[str] = Query(default="updated_at"),
+    sort_order: Optional[str] = Query(default="desc"),
     user: dict = Depends(get_current_user)
 ):
     query = {"shop_id": user["shop_id"]}
@@ -439,11 +971,26 @@ async def list_products(
     
     if category:
         query["category"] = category
+
+    price_filter = {}
+    if min_price is not None:
+        price_filter["$gte"] = min_price
+    if max_price is not None:
+        price_filter["$lte"] = max_price
+    if price_filter:
+        query["unit_price"] = price_filter
     
     products = await db.products.find(query, {"_id": 0}).to_list(1000)
     
     if low_stock:
         products = [p for p in products if p["stock_quantity"] <= p["min_stock_level"]]
+    if in_stock:
+        products = [p for p in products if p["stock_quantity"] > 0]
+
+    reverse = sort_order != "asc"
+    allowed_sort_fields = {"updated_at", "created_at", "unit_price", "name", "stock_quantity"}
+    sort_key = sort_by if sort_by in allowed_sort_fields else "updated_at"
+    products = sorted(products, key=lambda item: item.get(sort_key) or "", reverse=reverse)
     
     return [ProductResponse(**p) for p in products]
 
@@ -457,7 +1004,7 @@ async def get_product(product_id: str, user: dict = Depends(get_current_user)):
     return ProductResponse(**product)
 
 @api_router.put("/products/{product_id}", response_model=ProductResponse)
-async def update_product(product_id: str, data: ProductUpdate, user: dict = Depends(get_current_user)):
+async def update_product(product_id: str, data: ProductUpdate, user: dict = Depends(require_owner)):
     update_data = {k: v for k, v in data.model_dump().items() if v is not None}
     update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
     
@@ -471,6 +1018,32 @@ async def update_product(product_id: str, data: ProductUpdate, user: dict = Depe
     
     product = await db.products.find_one({"id": product_id}, {"_id": 0})
     return ProductResponse(**product)
+
+@api_router.post("/products/{product_id}/image", response_model=ProductResponse)
+async def upload_product_image(
+    product_id: str,
+    image: UploadFile = File(...),
+    user: dict = Depends(require_owner)
+):
+    product = await db.products.find_one({"id": product_id, "shop_id": user["shop_id"]}, {"_id": 0})
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    extension = Path(image.filename or "").suffix.lower() or ".jpg"
+    if extension not in {".jpg", ".jpeg", ".png", ".webp"}:
+        raise HTTPException(status_code=400, detail="Unsupported image format")
+
+    filename = f"{product_id}-{uuid4().hex}{extension}"
+    destination = MEDIA_PATH / filename
+    destination.write_bytes(await image.read())
+    image_url = build_media_url(filename)
+
+    await db.products.update_one(
+        {"id": product_id, "shop_id": user["shop_id"]},
+        {"$set": {"image_url": image_url, "updated_at": datetime.now(timezone.utc).isoformat()}}
+    )
+    updated = await db.products.find_one({"id": product_id, "shop_id": user["shop_id"]}, {"_id": 0})
+    return ProductResponse(**updated)
 
 @api_router.delete("/products/{product_id}")
 async def delete_product(product_id: str, user: dict = Depends(require_owner)):
@@ -832,6 +1405,268 @@ async def mpesa_check_status(checkout_request_id: str, user: dict = Depends(get_
         "mpesa_receipt": transaction.get("mpesa_receipt")
     }
 
+@api_router.post("/mpesa/webhook", response_model=dict)
+async def mpesa_webhook(payload: dict, x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret")):
+    if x_webhook_secret != settings.mpesa_webhook_secret:
+        raise HTTPException(status_code=401, detail="Invalid webhook secret")
+
+    checkout_request_id = payload.get("checkout_request_id")
+    if not checkout_request_id:
+        raise HTTPException(status_code=400, detail="checkout_request_id is required")
+
+    transaction = await db.mpesa_transactions.find_one({"checkout_request_id": checkout_request_id}, {"_id": 0})
+    payment = await db.payments.find_one({"checkout_request_id": checkout_request_id}, {"_id": 0})
+    if not transaction and not payment:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+
+    mpesa_receipt = payload.get("mpesa_receipt") or f"MPESA-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+
+    async def operation(session):
+        if transaction:
+            await db.mpesa_transactions.update_one(
+                {"checkout_request_id": checkout_request_id},
+                {"$set": {"status": "completed", "mpesa_receipt": mpesa_receipt, "webhook_payload": payload}},
+                session=session
+            )
+            await db.orders.update_one(
+                {"mpesa_checkout_request_id": checkout_request_id},
+                {"$set": {"payment_status": "paid", "status": "paid", "mpesa_receipt": mpesa_receipt, "updated_at": datetime.now(timezone.utc).isoformat()}},
+                session=session
+            )
+        if payment and payment.get("type") == "subscription":
+            expires_at = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+            await db.payments.update_one(
+                {"checkout_request_id": checkout_request_id},
+                {"$set": {"status": "successful", "mpesa_receipt": mpesa_receipt, "paid_at": datetime.now(timezone.utc).isoformat()}},
+                session=session
+            )
+            await db.subscriptions.insert_one({
+                "id": str(uuid4()),
+                "shop_id": payment["shop_id"],
+                "owner_id": payment["owner_id"],
+                "amount": 300,
+                "status": "active",
+                "paid_at": datetime.now(timezone.utc).isoformat(),
+                "expires_at": expires_at,
+                "mpesa_receipt": mpesa_receipt
+            }, session=session)
+
+    await run_transaction(operation)
+    return {"message": "Webhook processed", "mpesa_receipt": mpesa_receipt}
+
+# =============================================================================
+# CART & ORDER ROUTES
+# =============================================================================
+
+@api_router.get("/cart", response_model=CartResponse)
+async def get_cart(user: dict = Depends(get_current_user)):
+    return await build_cart_response(user)
+
+@api_router.put("/cart", response_model=CartResponse)
+async def replace_cart(items: List[CartItem], user: dict = Depends(get_current_user)):
+    now = datetime.now(timezone.utc).isoformat()
+    await db.cart.update_one(
+        {"user_id": user["id"], "shop_id": user["shop_id"]},
+        {
+            "$set": {
+                "items": [item.model_dump() for item in items],
+                "updated_at": now
+            },
+            "$setOnInsert": {"id": str(uuid4())}
+        },
+        upsert=True
+    )
+    return await build_cart_response(user)
+
+@api_router.post("/cart/items", response_model=CartResponse)
+async def add_cart_item(item: CartItem, user: dict = Depends(get_current_user)):
+    cart = await db.cart.find_one({"user_id": user["id"], "shop_id": user["shop_id"]}, {"_id": 0}) or {
+        "id": str(uuid4()),
+        "user_id": user["id"],
+        "shop_id": user["shop_id"],
+        "items": []
+    }
+    items = cart["items"]
+    for existing in items:
+        if existing["product_id"] == item.product_id:
+            existing["quantity"] = item.quantity
+            break
+    else:
+        items.append(item.model_dump())
+
+    await db.cart.update_one(
+        {"user_id": user["id"], "shop_id": user["shop_id"]},
+        {"$set": {"id": cart["id"], "items": items, "updated_at": datetime.now(timezone.utc).isoformat()}},
+        upsert=True
+    )
+    return await build_cart_response(user)
+
+@api_router.delete("/cart/items/{product_id}", response_model=CartResponse)
+async def remove_cart_item(product_id: str, user: dict = Depends(get_current_user)):
+    cart = await db.cart.find_one({"user_id": user["id"], "shop_id": user["shop_id"]}, {"_id": 0})
+    if cart:
+        items = [item for item in cart.get("items", []) if item["product_id"] != product_id]
+        await db.cart.update_one(
+            {"user_id": user["id"], "shop_id": user["shop_id"]},
+            {"$set": {"items": items, "updated_at": datetime.now(timezone.utc).isoformat()}}
+        )
+    return await build_cart_response(user)
+
+@api_router.post("/orders/checkout", response_model=OrderResponse)
+async def checkout_cart(data: CheckoutRequest, user: dict = Depends(get_current_user)):
+    cart = await build_cart_response(user)
+    if not cart.items:
+        raise HTTPException(status_code=400, detail="Cart is empty")
+
+    for item in cart.items:
+        product = await db.products.find_one({"id": item.product_id, "shop_id": user["shop_id"]}, {"_id": 0})
+        if not product or product["stock_quantity"] < item.quantity:
+            raise HTTPException(status_code=400, detail=f"Insufficient stock for {item.product_name}")
+
+    now = datetime.now(timezone.utc).isoformat()
+    order_id = str(uuid4())
+    checkout_request_id = None
+    payment_status = "pending" if data.payment_method == "mpesa" else "paid"
+    order_status = "pending" if data.payment_method == "mpesa" else "paid"
+
+    payment_id = str(uuid4())
+    if data.payment_method == "mpesa":
+        checkout_request_id = f"ws_CO_{uuid4().hex[:12]}"
+
+    order = {
+        "id": order_id,
+        "order_number": generate_order_number(),
+        "shop_id": user["shop_id"],
+        "customer_name": data.customer_name,
+        "customer_email": data.customer_email or user.get("email"),
+        "customer_phone": data.customer_phone,
+        "shipping_address": data.shipping_address,
+        "notes": data.notes,
+        "items": [item.model_dump() for item in cart.items],
+        "total_amount": cart.total_amount,
+        "payment_method": data.payment_method,
+        "payment_status": payment_status,
+        "status": order_status,
+        "mpesa_checkout_request_id": checkout_request_id,
+        "mpesa_receipt": None,
+        "created_by": user["id"],
+        "created_at": now,
+        "updated_at": now
+    }
+    async def operation(session):
+        if data.payment_method == "mpesa":
+            await db.mpesa_transactions.insert_one({
+                "id": str(uuid4()),
+                "checkout_request_id": checkout_request_id,
+                "merchant_request_id": str(uuid4()),
+                "phone": data.customer_phone,
+                "amount": cart.total_amount,
+                "reference": order_id,
+                "shop_id": user["shop_id"],
+                "status": "pending",
+                "callback_url": settings.mpesa_callback_url or None,
+                "created_at": now
+            }, session=session)
+
+        for item in cart.items:
+            await db.products.update_one(
+                {"id": item.product_id, "shop_id": user["shop_id"]},
+                {"$inc": {"stock_quantity": -item.quantity}},
+                session=session
+            )
+            await db.order_items.insert_one({
+                "id": str(uuid4()),
+                "order_id": order_id,
+                "product_id": item.product_id,
+                "quantity": item.quantity,
+                "price": item.unit_price
+            }, session=session)
+
+        await db.orders.insert_one(order, session=session)
+        await db.payments.insert_one({
+            "id": payment_id,
+            "shop_id": user["shop_id"],
+            "order_id": order_id,
+            "amount": cart.total_amount,
+            "status": "pending" if data.payment_method == "mpesa" else "successful",
+            "method": data.payment_method,
+            "checkout_request_id": checkout_request_id,
+            "created_at": now,
+            "user_id": user["user_id"]
+        }, session=session)
+        await db.cart.update_one(
+            {"user_id": user["id"], "shop_id": user["shop_id"]},
+            {"$set": {"items": [], "updated_at": now}},
+            upsert=True,
+            session=session
+        )
+
+    await run_transaction(operation)
+    await create_notification(
+        user_id=user["id"],
+        shop_id=user["shop_id"],
+        title="Order created",
+        message=f"Order {order['order_number']} was created with status {order['status']}",
+        metadata={"order_id": order_id}
+    )
+
+    confirmation_email = order.get("customer_email") or user.get("email")
+    if confirmation_email:
+        await send_transactional_email(
+            user_id=user["id"],
+            shop_id=user["shop_id"],
+            to_email=confirmation_email,
+            subject=f"Order confirmation: {order['order_number']}",
+            body=(
+                f"Hello {order.get('customer_name') or user['name']},\n\n"
+                f"Your order {order['order_number']} has been created.\n"
+                f"Payment method: {order['payment_method']}\n"
+                f"Order total: KES {order['total_amount']:.2f}\n"
+                f"Current status: {order['status']}\n\n"
+                "Thank you for shopping with CloudDuka."
+            ),
+            notification_title="Order confirmation email sent",
+            metadata={"order_id": order_id, "order_number": order["order_number"]}
+        )
+    return OrderResponse(**order)
+
+@api_router.get("/orders", response_model=List[OrderResponse])
+async def list_orders(
+    status: Optional[str] = None,
+    payment_status: Optional[str] = None,
+    user: dict = Depends(get_current_user)
+):
+    query = {"shop_id": user["shop_id"]}
+    if status:
+        query["status"] = status
+    if payment_status:
+        query["payment_status"] = payment_status
+    orders = await db.orders.find(query, {"_id": 0}).sort("created_at", -1).to_list(200)
+    return [OrderResponse(**order) for order in orders]
+
+@api_router.get("/orders/{order_id}", response_model=OrderResponse)
+async def get_order(order_id: str, user: dict = Depends(get_current_user)):
+    order = await db.orders.find_one({"id": order_id, "shop_id": user["shop_id"]}, {"_id": 0})
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    return OrderResponse(**order)
+
+@api_router.put("/orders/{order_id}/status", response_model=OrderResponse)
+async def update_order_status(order_id: str, data: OrderStatusUpdate, owner: dict = Depends(require_owner)):
+    await db.orders.update_one(
+        {"id": order_id, "shop_id": owner["shop_id"]},
+        {"$set": {"status": data.status, "updated_at": datetime.now(timezone.utc).isoformat()}}
+    )
+    order = await db.orders.find_one({"id": order_id, "shop_id": owner["shop_id"]}, {"_id": 0})
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    return OrderResponse(**order)
+
+@api_router.get("/orders/history/me", response_model=List[OrderResponse])
+async def my_order_history(user: dict = Depends(get_current_user)):
+    orders = await db.orders.find({"created_by": user["id"], "shop_id": user["shop_id"]}, {"_id": 0}).sort("created_at", -1).to_list(100)
+    return [OrderResponse(**order) for order in orders]
+
 # =============================================================================
 # USER MANAGEMENT ROUTES (Owner only)
 # =============================================================================
@@ -840,49 +1675,78 @@ async def mpesa_check_status(checkout_request_id: str, user: dict = Depends(get_
 async def create_user(data: UserCreate, owner: dict = Depends(require_owner)):
     """Create a shopkeeper (owner only)"""
     existing = await db.users.find_one({"phone": data.phone})
+    user_record = existing
     if existing:
-        raise HTTPException(status_code=400, detail="Phone already registered")
-    
-    user_id = str(uuid.uuid4())
-    user = {
-        "id": user_id,
-        "phone": data.phone,
-        "pin_hash": hash_pin(data.pin),
-        "name": data.name,
-        "role": "shopkeeper",  # Always shopkeeper when created by owner
+        user_id = existing["id"]
+    else:
+        user_id = str(uuid.uuid4())
+        user_record = {
+            "id": user_id,
+            "phone": data.phone,
+            "pin_hash": hash_pin(data.pin),
+            "name": data.name,
+            "email": data.email,
+            "email_verified": False,
+            "default_shop_id": owner["shop_id"],
+            "trial_ends_at": None,
+            "created_at": datetime.now(timezone.utc).isoformat()
+        }
+        await db.users.insert_one(user_record)
+
+    existing_membership = await db.shop_users.find_one({"user_id": user_id, "shop_id": owner["shop_id"]}, {"_id": 0})
+    if existing_membership:
+        raise HTTPException(status_code=400, detail="User already linked to this shop")
+
+    await db.shop_users.insert_one({
+        "id": str(uuid4()),
+        "user_id": user_id,
         "shop_id": owner["shop_id"],
-        "trial_ends_at": None,
-        "subscription_status": "active",
+        "role": "shopkeeper",
         "created_at": datetime.now(timezone.utc).isoformat()
-    }
-    
-    await db.users.insert_one(user)
+    })
     return UserResponse(
         id=user_id,
         phone=data.phone,
         name=data.name,
+        email=data.email,
+        email_verified=False,
         role="shopkeeper",
         shop_id=owner["shop_id"],
         subscription_status="active",
-        created_at=user["created_at"]
+        created_at=user_record["created_at"]
     )
 
 @api_router.get("/users", response_model=List[UserResponse])
 async def list_users(owner: dict = Depends(require_owner)):
     """List all users in the shop"""
-    users = await db.users.find({"shop_id": owner["shop_id"]}, {"_id": 0, "pin_hash": 0}).to_list(100)
-    return [UserResponse(**u) for u in users]
+    memberships = await db.shop_users.find({"shop_id": owner["shop_id"]}, {"_id": 0}).to_list(100)
+    users = []
+    for membership in memberships:
+        user = await db.users.find_one({"id": membership["user_id"]}, {"_id": 0, "pin_hash": 0})
+        if user:
+            users.append(UserResponse(
+                id=user["id"],
+                phone=user["phone"],
+                name=user["name"],
+                email=user.get("email"),
+                email_verified=user.get("email_verified", False),
+                role=membership["role"],
+                shop_id=membership["shop_id"],
+                subscription_status="active",
+                created_at=user["created_at"]
+            ))
+    return users
 
 @api_router.delete("/users/{user_id}")
 async def delete_user(user_id: str, owner: dict = Depends(require_owner)):
     """Delete a shopkeeper (owner only)"""
-    user = await db.users.find_one({"id": user_id, "shop_id": owner["shop_id"]}, {"_id": 0})
-    if not user:
+    membership = await db.shop_users.find_one({"user_id": user_id, "shop_id": owner["shop_id"]}, {"_id": 0})
+    if not membership:
         raise HTTPException(status_code=404, detail="User not found")
-    if user["role"] == "owner":
+    if membership["role"] == "owner":
         raise HTTPException(status_code=400, detail="Cannot delete owner")
     
-    await db.users.delete_one({"id": user_id})
+    await db.shop_users.delete_one({"id": membership["id"]})
     return {"message": "User deleted"}
 
 # =============================================================================
@@ -909,11 +1773,9 @@ async def get_dashboard_stats(user: dict = Depends(get_current_user)):
     mpesa_sales = sum(s["total_amount"] for s in today_sales if s["payment_method"] == "mpesa")
     credit_sales = sum(s["total_amount"] for s in today_sales if s["payment_method"] == "credit")
     
-    # Low stock products
-    low_stock = await db.products.find(
-        {"shop_id": shop_id, "$expr": {"$lte": ["$stock_quantity", "$min_stock_level"]}},
-        {"_id": 0}
-    ).to_list(100)
+    # Restock suggestions are calculated server-side so every dashboard uses the
+    # same urgency scoring and recommended reorder quantity.
+    low_stock = await get_shop_low_stock_products(shop_id)
     
     # Total credit outstanding
     credit_customers = await db.credit_customers.find({"shop_id": shop_id}, {"_id": 0}).to_list(1000)
@@ -953,9 +1815,19 @@ async def get_dashboard_stats(user: dict = Depends(get_current_user)):
         },
         "low_stock_count": len(low_stock),
         "low_stock_items": low_stock[:5],
+        "restock_suggestions": low_stock[:10],
         "total_credit_outstanding": total_credit,
         "recent_sales": recent_sales,
         "weekly_sales": weekly_data
+    }
+
+@api_router.get("/reports/restock-suggestions")
+async def get_restock_suggestions(limit: int = 20, user: dict = Depends(get_current_user)):
+    suggestions = await get_shop_low_stock_products(user["shop_id"])
+    return {
+        "shop_id": user["shop_id"],
+        "count": len(suggestions),
+        "items": suggestions[: max(limit, 1)]
     }
 
 @api_router.get("/reports/sales")
@@ -1269,6 +2141,139 @@ async def delete_supplier(supplier_id: str, user: dict = Depends(require_owner))
     return {"message": "Supplier deleted"}
 
 # =============================================================================
+# MARKETPLACE ORDERING ROUTES
+# =============================================================================
+
+@api_router.get("/marketplace/vendors", response_model=List[SupplierResponse])
+async def list_marketplace_vendors(user: dict = Depends(get_current_user)):
+    return await list_suppliers(user=user)
+
+@api_router.post("/marketplace/orders", response_model=dict)
+async def create_marketplace_order(data: MarketplaceOrderCreate, owner: dict = Depends(require_owner)):
+    vendor = await db.suppliers.find_one({"id": data.vendor_id, "shop_id": owner["shop_id"]}, {"_id": 0})
+    if not vendor:
+        raise HTTPException(status_code=404, detail="Vendor not found")
+
+    now = datetime.now(timezone.utc).isoformat()
+    order_id = str(uuid4())
+    payment_id = str(uuid4())
+    total_amount = round(sum(item.quantity * item.unit_cost for item in data.items), 2)
+    order = {
+        "id": order_id,
+        "order_number": generate_purchase_number(),
+        "shop_id": owner["shop_id"],
+        "order_type": "marketplace",
+        "vendor_id": vendor["id"],
+        "vendor_name": vendor["name"],
+        "customer_name": vendor["name"],
+        "customer_email": None,
+        "customer_phone": vendor["phone"],
+        "shipping_address": None,
+        "notes": data.notes,
+        "items": [
+            {
+                "product_id": item.product_id,
+                "product_name": item.product_name,
+                "quantity": item.quantity,
+                "unit_price": item.unit_cost,
+                "total": round(item.quantity * item.unit_cost, 2)
+            }
+            for item in data.items
+        ],
+        "total_amount": total_amount,
+        "payment_method": data.payment_method,
+        "payment_status": "pending",
+        "status": "ordered",
+        "mpesa_checkout_request_id": None,
+        "mpesa_receipt": None,
+        "created_by": owner["user_id"],
+        "created_at": now,
+        "updated_at": now
+    }
+
+    async def operation(session):
+        for item in data.items:
+            await db.order_items.insert_one({
+                "id": str(uuid4()),
+                "order_id": order_id,
+                "product_id": item.product_id,
+                "product_name": item.product_name,
+                "quantity": item.quantity,
+                "price": item.unit_cost,
+                "item_type": "marketplace",
+            }, session=session)
+
+        await db.orders.insert_one(order, session=session)
+        await db.payments.insert_one({
+            "id": payment_id,
+            "shop_id": owner["shop_id"],
+            "order_id": order_id,
+            "amount": total_amount,
+            "status": "pending",
+            "method": data.payment_method,
+            "provider": data.payment_method,
+            "type": "marketplace_order",
+            "user_id": owner["user_id"],
+            "created_at": now,
+        }, session=session)
+
+    await run_transaction(operation)
+    return order
+
+@api_router.get("/marketplace/orders", response_model=List[dict])
+async def list_marketplace_orders(user: dict = Depends(get_current_user)):
+    orders = await db.orders.find(
+        {"shop_id": user["shop_id"], "order_type": "marketplace"},
+        {"_id": 0}
+    ).sort("created_at", -1).to_list(200)
+    return orders
+
+@api_router.post("/marketplace/orders/{order_id}/receive", response_model=dict)
+async def receive_marketplace_order(order_id: str, data: MarketplaceDeliveryUpdate, owner: dict = Depends(require_owner)):
+    order = await db.orders.find_one(
+        {"id": order_id, "shop_id": owner["shop_id"], "order_type": "marketplace"},
+        {"_id": 0}
+    )
+    if not order:
+        raise HTTPException(status_code=404, detail="Marketplace order not found")
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    async def operation(session):
+        if data.status == "delivered":
+            for item in order.get("items", []):
+                # Delivery updates stock only once, guarded by the status check above.
+                await db.products.update_one(
+                    {"id": item["product_id"], "shop_id": owner["shop_id"]},
+                    {"$inc": {"stock_quantity": item["quantity"]}, "$set": {"updated_at": now}},
+                    session=session
+                )
+            await db.payments.update_one(
+                {"order_id": order_id, "shop_id": owner["shop_id"]},
+                {"$set": {"status": "successful", "updated_at": now}},
+                session=session
+            )
+        elif data.status == "cancelled":
+            await db.payments.update_one(
+                {"order_id": order_id, "shop_id": owner["shop_id"]},
+                {"$set": {"status": "cancelled", "updated_at": now}},
+                session=session
+            )
+
+        await db.orders.update_one(
+            {"id": order_id, "shop_id": owner["shop_id"]},
+            {"$set": {"status": data.status, "payment_status": "paid" if data.status == "delivered" else "cancelled", "notes": data.notes or order.get("notes"), "updated_at": now}},
+            session=session
+        )
+
+    if order.get("status") == "delivered":
+        raise HTTPException(status_code=400, detail="Marketplace order already delivered")
+
+    await run_transaction(operation)
+    updated = await db.orders.find_one({"id": order_id, "shop_id": owner["shop_id"]}, {"_id": 0})
+    return updated
+
+# =============================================================================
 # PURCHASE ROUTES
 # =============================================================================
 
@@ -1404,6 +2409,185 @@ async def get_purchases_summary(user: dict = Depends(get_current_user)):
     }
 
 # =============================================================================
+# DASHBOARD EXTENSIONS
+# =============================================================================
+
+@api_router.get("/dashboard/vendor")
+async def get_vendor_dashboard(user: dict = Depends(require_owner)):
+    products_count = await db.products.count_documents({"shop_id": user["shop_id"]})
+    orders = await db.orders.find({"shop_id": user["shop_id"]}, {"_id": 0}).sort("created_at", -1).to_list(200)
+    payments = await db.payments.find({"shop_id": user["shop_id"]}, {"_id": 0}).sort("created_at", -1).to_list(200)
+    marketplace_orders = [order for order in orders if order.get("order_type") == "marketplace"]
+    total_earnings = sum(order["total_amount"] for order in orders if order.get("payment_status") == "paid")
+    pending_orders = sum(1 for order in orders if order.get("status") not in {"completed", "cancelled"})
+    restock_suggestions = await get_shop_low_stock_products(user["shop_id"])
+    top_products = sorted(
+        (
+            {
+                "product_name": item["product_name"],
+                "quantity": item["quantity"],
+                "total": item["total"]
+            }
+            for order in orders
+            for item in order.get("items", [])
+        ),
+        key=lambda item: item["quantity"],
+        reverse=True
+    )[:5]
+    return {
+        "shop_id": user["shop_id"],
+        "products_count": products_count,
+        "total_earnings": total_earnings,
+        "pending_orders": pending_orders,
+        "restock_suggestions": restock_suggestions[:5],
+        "payments_summary": summarize_payment_mix(payments),
+        "marketplace_orders": marketplace_orders[:10],
+        "recent_orders": orders[:10],
+        "top_products": top_products
+    }
+
+@api_router.get("/dashboard/admin")
+async def get_admin_dashboard(owner: dict = Depends(require_owner)):
+    owned_shops = await db.shops.find({"owner_id": owner["id"]}, {"_id": 0}).to_list(100)
+    shop_ids = [shop["id"] for shop in owned_shops]
+    memberships = await db.shop_users.find({"shop_id": {"$in": shop_ids}}, {"_id": 0}).to_list(1000)
+    users_count = len({membership["user_id"] for membership in memberships})
+    orders = await db.orders.find({"shop_id": {"$in": shop_ids}}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    payments = await db.payments.find({"shop_id": {"$in": shop_ids}}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    total_revenue = sum(order["total_amount"] for order in orders if order.get("payment_status") == "paid")
+    restock_suggestions = []
+    for shop in owned_shops:
+        for suggestion in await get_shop_low_stock_products(shop["id"]):
+            restock_suggestions.append({**suggestion, "shop_id": shop["id"], "shop_name": shop["name"]})
+    restock_suggestions = sorted(restock_suggestions, key=lambda item: (-item["urgency_score"], item["shop_name"]))[:10]
+    return {
+        "shops_count": len(owned_shops),
+        "users_count": users_count,
+        "orders_count": len(orders),
+        "total_revenue": total_revenue,
+        "payments_summary": summarize_payment_mix(payments),
+        "restock_suggestions": restock_suggestions,
+        "marketplace_orders": [order for order in orders if order.get("order_type") == "marketplace"][:10],
+        "recent_orders": orders[:10]
+    }
+
+@api_router.get("/payments/summary")
+async def get_payments_summary(user: dict = Depends(get_current_user)):
+    payments = await db.payments.find({"shop_id": user["shop_id"]}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    subscriptions = await db.subscriptions.find({"shop_id": user["shop_id"]}, {"_id": 0}).sort("expires_at", -1).to_list(20)
+    return {
+        "shop_id": user["shop_id"],
+        "summary": summarize_payment_mix(payments),
+        "recent_payments": payments[:10],
+        "subscriptions": subscriptions[:5]
+    }
+
+@api_router.get("/payments/providers/compare")
+async def compare_payment_providers(user: dict = Depends(require_owner)):
+    return {
+        "recommended_provider": "paystack",
+        "recommended_for": "multi-country card and wallet growth",
+        "comparison": [
+            {
+                "provider": "mpesa",
+                "best_for": "Kenyan mobile money collections and subscription renewals",
+                "strengths": ["Deep local trust", "Low customer friction for Kenya", "Strong cash-to-wallet conversion"],
+                "tradeoffs": ["Primarily regional", "Less flexible for cards and cross-border scale"],
+            },
+            {
+                "provider": "paystack",
+                "best_for": "Regional scaling across cards, bank transfers, and multiple digital payment rails",
+                "strengths": ["Broader payment method coverage", "Better fit for marketplace expansion", "Stronger developer ecosystem for retries/webhooks"],
+                "tradeoffs": ["M-Pesa still feels more native for many Kenyan-only merchants"],
+            },
+        ],
+        "guidance": "Keep M-Pesa for local checkout and subscription collections in Kenya, but add Paystack as the scalable default for marketplace and card-heavy growth. Subscriptions remain isolated per shop because each payment record and subscription row is stored with its own shop_id.",
+    }
+
+@api_router.get("/notifications")
+async def list_notifications(user: dict = Depends(get_current_user)):
+    notifications = await db.notifications.find(
+        {"user_id": user["id"], "shop_id": user["shop_id"]},
+        {"_id": 0}
+    ).sort("sent_at", -1).to_list(100)
+    return notifications
+
+@api_router.get("/uploads/{filename}")
+async def get_uploaded_file(filename: str):
+    file_path = MEDIA_PATH / filename
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    return {"url": build_media_url(filename), "filename": filename}
+
+@api_router.post("/shops", response_model=dict)
+async def create_shop(data: ShopCreate, owner: dict = Depends(require_owner)):
+    shop_id = str(uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    shop = {
+        "id": shop_id,
+        "name": data.name,
+        "address": data.address,
+        "phone": data.phone,
+        "email": data.email,
+        "owner_id": owner["user_id"],
+        "created_at": now
+    }
+    await db.shops.insert_one(shop)
+    await db.shop_users.insert_one({
+        "id": str(uuid4()),
+        "user_id": owner["user_id"],
+        "shop_id": shop_id,
+        "role": "owner",
+        "created_at": now
+    })
+    await db.subscriptions.insert_one({
+        "id": str(uuid4()),
+        "shop_id": shop_id,
+        "owner_id": owner["user_id"],
+        "amount": 300,
+        "status": "active",
+        "paid_at": now,
+        "expires_at": (datetime.now(timezone.utc) + timedelta(days=14)).isoformat(),
+        "mpesa_receipt": "TRIAL"
+    })
+    return shop
+
+@api_router.get("/shops", response_model=List[dict])
+async def list_shops(user: dict = Depends(get_current_user)):
+    memberships = await db.shop_users.find({"user_id": user["user_id"]}, {"_id": 0}).to_list(100)
+    shops = []
+    for membership in memberships:
+        shop = await db.shops.find_one({"id": membership["shop_id"]}, {"_id": 0})
+        if shop:
+            shops.append({**shop, "role": membership["role"]})
+    return shops
+
+@api_router.get("/subscriptions/current", response_model=dict)
+async def get_current_subscription(user: dict = Depends(get_current_user)):
+    subscription = await get_active_subscription(user["shop_id"])
+    if not subscription:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    return subscription
+
+@api_router.post("/subscriptions/pay", response_model=dict)
+async def initiate_subscription_payment(owner: dict = Depends(require_owner)):
+    now = datetime.now(timezone.utc).isoformat()
+    payment_id = str(uuid4())
+    checkout_request_id = f"sub_{uuid4().hex[:12]}"
+    payment = {
+        "id": payment_id,
+        "shop_id": owner["shop_id"],
+        "owner_id": owner["user_id"],
+        "type": "subscription",
+        "amount": 300,
+        "status": "pending",
+        "checkout_request_id": checkout_request_id,
+        "created_at": now
+    }
+    await db.payments.insert_one(payment)
+    return payment
+
+# =============================================================================
 # SHOP SETTINGS
 # =============================================================================
 
@@ -1429,7 +2613,11 @@ async def update_shop(data: dict, owner: dict = Depends(require_owner)):
 
 @api_router.get("/health")
 async def health_check():
-    return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "environment": settings.app_env
+    }
 
 # Include router
 app.include_router(api_router)
@@ -1438,10 +2626,29 @@ app.include_router(api_router)
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_origins=settings.cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.on_event("startup")
+async def ensure_indexes():
+    await db.users.create_index("phone", unique=True)
+    await db.users.create_index("id", unique=True)
+    await db.products.create_index("shop_id")
+    await db.products.create_index("id", unique=True)
+    await db.orders.create_index("shop_id")
+    await db.orders.create_index("id", unique=True)
+    await db.orders.create_index("created_by")
+    await db.shop_users.create_index([("user_id", 1), ("shop_id", 1)], unique=True)
+    await db.cart.create_index([("shop_id", 1), ("user_id", 1)], unique=True)
+    await db.order_items.create_index("order_id")
+    await db.order_items.create_index("product_id")
+    await db.payments.create_index("shop_id")
+    await db.payments.create_index("user_id")
+    await db.payments.create_index("order_id")
+    await db.subscriptions.create_index("shop_id")
+    await db.notifications.create_index([("user_id", 1), ("sent_at", -1)])
 
 @app.on_event("shutdown")
 async def shutdown_db_client():

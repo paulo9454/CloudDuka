@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { useAuthStore, api, formatCurrency, formatDate, formatDateTime } from '../lib/store';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
 import { Button } from '../components/ui/button';
@@ -41,7 +41,7 @@ export default function ReportsPage() {
 
   const formatDateForApi = (date) => date.toISOString();
 
-  const loadSalesReport = async () => {
+  const loadSalesReport = useCallback(async () => {
     setLoading(true);
     try {
       const data = await api.get(
@@ -53,9 +53,9 @@ export default function ReportsPage() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [endDate, startDate]);
 
-  const loadCreditReport = async () => {
+  const loadCreditReport = useCallback(async () => {
     setLoading(true);
     try {
       const data = await api.get('/reports/credit');
@@ -65,9 +65,9 @@ export default function ReportsPage() {
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
 
-  const loadDamagedReport = async () => {
+  const loadDamagedReport = useCallback(async () => {
     setLoading(true);
     try {
       const data = await api.get(
@@ -79,13 +79,13 @@ export default function ReportsPage() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [endDate, startDate]);
 
   useEffect(() => {
     if (activeTab === 'sales') loadSalesReport();
     else if (activeTab === 'credit') loadCreditReport();
     else if (activeTab === 'damaged') loadDamagedReport();
-  }, [activeTab]);
+  }, [activeTab, loadCreditReport, loadDamagedReport, loadSalesReport]);
 
   const handleDateChange = () => {
     if (activeTab === 'sales') loadSalesReport();

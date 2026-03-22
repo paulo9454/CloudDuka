@@ -15,7 +15,6 @@ import {
   WifiOff,
   Truck,
   ShoppingBag,
-  HelpCircle,
   MessageSquare
 } from 'lucide-react';
 
@@ -31,6 +30,9 @@ import UsersPage from './pages/UsersPage';
 import SettingsPage from './pages/SettingsPage';
 import SuppliersPage from './pages/SuppliersPage';
 import PurchasesPage from './pages/PurchasesPage';
+import OrdersPage from './pages/OrdersPage';
+import VendorDashboardPage from './pages/VendorDashboardPage';
+import AdminDashboardPage from './pages/AdminDashboardPage';
 
 // Protected Route Component
 const ProtectedRoute = ({ children }) => {
@@ -74,9 +76,16 @@ const BottomNav = () => {
   
   const moreItems = [
     { path: '/credit', icon: CreditCard, label: 'Credit' },
+    { path: '/orders', icon: ShoppingBag, label: 'Orders' },
     { path: '/damaged', icon: Trash2, label: 'Damaged' },
     { path: '/reports', icon: BarChart3, label: 'Reports' },
-    ...(user?.role === 'owner' ? [{ path: '/users', icon: Users, label: 'Users' }] : []),
+    ...(user?.role === 'owner' ? [
+      { path: '/purchases', icon: Truck, label: 'Marketplace' },
+      { path: '/suppliers', icon: MessageSquare, label: 'Vendors' },
+      { path: '/vendor-dashboard', icon: LayoutDashboard, label: 'Vendor' },
+      { path: '/admin-dashboard', icon: BarChart3, label: 'Admin' },
+      { path: '/users', icon: Users, label: 'Users' },
+    ] : []),
     { path: '/settings', icon: Settings, label: 'Settings' },
   ];
 
@@ -247,6 +256,16 @@ function App() {
             } 
           />
           <Route 
+            path="/orders" 
+            element={
+              <ProtectedRoute>
+                <MainLayout>
+                  <OrdersPage />
+                </MainLayout>
+              </ProtectedRoute>
+            } 
+          />
+          <Route 
             path="/damaged" 
             element={
               <ProtectedRoute>
@@ -277,6 +296,26 @@ function App() {
             } 
           />
           <Route 
+            path="/vendor-dashboard" 
+            element={
+              <OwnerRoute>
+                <MainLayout>
+                  <VendorDashboardPage />
+                </MainLayout>
+              </OwnerRoute>
+            } 
+          />
+          <Route 
+            path="/admin-dashboard" 
+            element={
+              <OwnerRoute>
+                <MainLayout>
+                  <AdminDashboardPage />
+                </MainLayout>
+              </OwnerRoute>
+            } 
+          />
+          <Route 
             path="/settings" 
             element={
               <ProtectedRoute>
@@ -284,6 +323,26 @@ function App() {
                   <SettingsPage />
                 </MainLayout>
               </ProtectedRoute>
+            } 
+          />
+          <Route 
+            path="/suppliers" 
+            element={
+              <OwnerRoute>
+                <MainLayout>
+                  <SuppliersPage />
+                </MainLayout>
+              </OwnerRoute>
+            } 
+          />
+          <Route 
+            path="/purchases" 
+            element={
+              <OwnerRoute>
+                <MainLayout>
+                  <PurchasesPage />
+                </MainLayout>
+              </OwnerRoute>
             } 
           />
           
