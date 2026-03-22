@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { useAuthStore, api, formatCurrency } from '../lib/store';
 import { Card, CardContent } from '../components/ui/card';
@@ -54,17 +54,8 @@ export default function ProductsPage() {
     min_stock_level: '5',
   });
 
-  useEffect(() => {
-    loadProducts();
-    loadCategories();
-  }, []);
 
-  // Auto-calculate cost per unit and total stock when buying details change
-  useEffect(() => {
-    calculateValues();
-  }, [formData.buying_unit, formData.buying_cost, formData.items_per_packet, formData.buying_quantity]);
-
-  const calculateValues = () => {
+  const calculateValues = useCallback(() => {
     const cost = parseFloat(formData.buying_cost) || 0;
     const buyingQty = parseInt(formData.buying_quantity) || 1;
     
@@ -89,9 +80,14 @@ export default function ProductsPage() {
       cost_per_unit: costPerUnit,
       stock_quantity: formData.buying_unit === 'single' ? prev.stock_quantity : totalUnits.toString()
     }));
-  };
+  }, [formData.buying_cost, formData.buying_quantity, formData.buying_unit, formData.items_per_packet]);
 
-  const loadProducts = async () => {
+  // Auto-calculate cost per unit and total stock when buying details change
+  useEffect(() => {
+    calculateValues();
+  }, [calculateValues]);
+
+  const loadProducts = useCallback(async () => {
     try {
       const data = await api.get('/products');
       setProducts(data);
@@ -100,16 +96,21 @@ export default function ProductsPage() {
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
 
-  const loadCategories = async () => {
+  const loadCategories = useCallback(async () => {
     try {
       const data = await api.get('/products/categories/list');
       setCategories(data);
     } catch (error) {
       console.error('Failed to load categories');
     }
-  };
+  }, []);
+
+  useEffect(() => {
+    loadProducts();
+    loadCategories();
+  }, [loadProducts, loadCategories]);
 
   const filteredProducts = products.filter((p) => {
     const matchesSearch = !searchQuery || 
