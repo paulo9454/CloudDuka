@@ -28,6 +28,7 @@ from fpdf import FPDF
 import base64
 import requests
 import time
+from bson import ObjectId
 
 load_dotenv()
 
@@ -417,12 +418,19 @@ class CheckoutRequest(BaseModel):
     customer_name: Optional[str] = None
     customer_email: Optional[str] = None
 
+    customer_id: Optional[str] = None
+
 
 class CheckoutResponse(BaseModel):
     id: str
     total_amount: float
     shop_id: str
     status: str
+
+    payment_status: str
+    payment_method: str
+    customer_id: Optional[str] = None
+    items: List[dict] = []
 
 
 class MarketplaceOrderItem(BaseModel):
@@ -442,6 +450,19 @@ class MarketplaceDeliveryUpdate(BaseModel):
     status: str
     notes: Optional[str] = None
 
+
+
+class CartItemCreate(BaseModel):
+    product_id: str
+    quantity: int = Field(gt=0)
+
+
+class CartItemUpdate(BaseModel):
+    quantity: int = Field(gt=0)
+
+
+class OrderStatusPatch(BaseModel):
+    status: str
 
 # =============================================================================
 # HELPER FUNCTIONS
@@ -626,6 +647,29 @@ def build_restock_suggestions(products: List[dict]) -> List[dict]:
                 }
             )
     return suggestions
+
+
+
+def is_valid_object_id(value: str) -> bool:
+    if not value or not isinstance(value, str):
+        return False
+    if ObjectId.is_valid(value):
+        return True
+    try:
+        uuid.UUID(value)
+        return True
+    except ValueError:
+        return False
+
+
+def normalize_object_ids(payload):
+    if isinstance(payload, dict):
+        return {key: normalize_object_ids(value) for key, value in payload.items()}
+    if isinstance(payload, list):
+        return [normalize_object_ids(item) for item in payload]
+    if isinstance(payload, ObjectId):
+        return str(payload)
+    return payload
 
 
 async def write_audit_log(
@@ -2049,6 +2093,266 @@ async def update_shop(data: dict, owner: dict = Depends(require_owner)):
     return shop
 
 
+
+@api_router.get("/cart")
+async def get_cart(user: dict = Depends(get_current_user)):
+    """Return the active user's cart with hydrated product details."""
+    cart = await db.cart.find_one(
+        {"user_id": user["id"], "shop_id": user["shop_id"]}, {"_id": 0}
+    )
+    if not cart:
+        return {"items": [], "summary": {"total_items": 0, "total_amount": 0}}
+
+    detailed_items = []
+    total_amount = 0.0
+    for item in cart.get("items", []):
+        product = await db.products.find_one(
+            {"id": item["product_id"], "shop_id": user["shop_id"]}, {"_id": 0}
+        )
+        if not product:
+            continue
+        line_total = product.get("unit_price", 0) * item["quantity"]
+        total_amount += line_total
+        detailed_items.append(
+            {
+                "id": item["id"],
+                "quantity": item["quantity"],
+                "line_total": line_total,
+                "product": product,
+            }
+        )
+
+    return normalize_object_ids(
+        {
+            "id": cart["id"],
+            "items": detailed_items,
+            "summary": {
+                "total_items": sum(i["quantity"] for i in cart.get("items", [])),
+                "total_amount": total_amount,
+            },
+        }
+    )
+
+
+@api_router.post("/cart")
+async def add_to_cart(data: CartItemCreate, user: dict = Depends(get_current_user)):
+    """Add an item to the authenticated user's cart."""
+    if not is_valid_object_id(data.product_id):
+        raise HTTPException(status_code=400, detail="Invalid ObjectId for product_id")
+
+    product = await db.products.find_one(
+        {"id": data.product_id, "shop_id": user["shop_id"]}, {"_id": 0}
+    )
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    cart = await db.cart.find_one(
+        {"user_id": user["id"], "shop_id": user["shop_id"]}, {"_id": 0}
+    )
+    if not cart:
+        cart = {
+            "id": str(uuid.uuid4()),
+            "user_id": user["id"],
+            "shop_id": user["shop_id"],
+            "items": [],
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    items = list(cart.get("items", []))
+    existing = next((item for item in items if item["product_id"] == data.product_id), None)
+    new_quantity = data.quantity + (existing["quantity"] if existing else 0)
+    if new_quantity > product.get("stock_quantity", 0):
+        raise HTTPException(status_code=400, detail="Insufficient stock for requested cart quantity")
+
+    if existing:
+        existing["quantity"] = new_quantity
+    else:
+        items.append(
+            {
+                "id": str(uuid.uuid4()),
+                "product_id": data.product_id,
+                "quantity": data.quantity,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+
+    await db.cart.update_one(
+        {"id": cart["id"]},
+        {
+            "$set": {
+                "user_id": user["id"],
+                "shop_id": user["shop_id"],
+                "items": items,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            "$setOnInsert": {"id": cart["id"]},
+        },
+        upsert=True,
+    )
+    await write_audit_log(user["shop_id"], user["id"], "add", "cart_item", data.product_id, {"quantity": data.quantity})
+    return {"message": "Item added to cart", "cart_id": cart["id"], "item_count": len(items)}
+
+
+@api_router.put("/cart/{item_id}")
+async def update_cart_item(
+    item_id: str,
+    data: CartItemUpdate,
+    user: dict = Depends(get_current_user),
+):
+    """Update the quantity of a cart item."""
+    if not is_valid_object_id(item_id):
+        raise HTTPException(status_code=400, detail="Invalid ObjectId for item_id")
+
+    cart = await db.cart.find_one(
+        {"user_id": user["id"], "shop_id": user["shop_id"]}, {"_id": 0}
+    )
+    if not cart:
+        raise HTTPException(status_code=404, detail="Cart not found")
+
+    items = list(cart.get("items", []))
+    item = next((entry for entry in items if entry["id"] == item_id), None)
+    if not item:
+        raise HTTPException(status_code=404, detail="Cart item not found")
+
+    product = await db.products.find_one(
+        {"id": item["product_id"], "shop_id": user["shop_id"]}, {"_id": 0}
+    )
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+    if data.quantity > product.get("stock_quantity", 0):
+        raise HTTPException(status_code=400, detail="Insufficient stock for requested quantity")
+
+    item["quantity"] = data.quantity
+    await db.cart.update_one(
+        {"id": cart["id"]},
+        {"$set": {"items": items, "updated_at": datetime.now(timezone.utc).isoformat()}},
+    )
+    await write_audit_log(user["shop_id"], user["id"], "update", "cart_item", item_id, {"quantity": data.quantity})
+    return {"message": "Cart item updated"}
+
+
+@api_router.delete("/cart/{item_id}")
+async def delete_cart_item(item_id: str, user: dict = Depends(get_current_user)):
+    """Remove an item from the active user's cart."""
+    if not is_valid_object_id(item_id):
+        raise HTTPException(status_code=400, detail="Invalid ObjectId for item_id")
+
+    cart = await db.cart.find_one(
+        {"user_id": user["id"], "shop_id": user["shop_id"]}, {"_id": 0}
+    )
+    if not cart:
+        raise HTTPException(status_code=404, detail="Cart not found")
+
+    items = list(cart.get("items", []))
+    filtered = [entry for entry in items if entry["id"] != item_id]
+    if len(filtered) == len(items):
+        raise HTTPException(status_code=404, detail="Cart item not found")
+
+    await db.cart.update_one(
+        {"id": cart["id"]},
+        {"$set": {"items": filtered, "updated_at": datetime.now(timezone.utc).isoformat()}},
+    )
+    await write_audit_log(user["shop_id"], user["id"], "delete", "cart_item", item_id)
+    return {"message": "Cart item removed"}
+
+
+@api_router.post("/orders/checkout")
+async def checkout_order(data: CheckoutRequest, user: dict = Depends(get_current_user)):
+    """Create an order from cart items and record payment.
+
+    Example response:
+    {
+      "order": {"id": "...", "total_amount": 1200.0, "payment_status": "successful"},
+      "items": [{"product_id": "...", "quantity": 2}]
+    }
+    """
+    result = await checkout_cart(data, user)
+    await write_audit_log(user["shop_id"], user["id"], "checkout", "order", result.id, {"payment_method": data.payment_method})
+    return {"order": result.model_dump(), "items": result.items}
+
+
+@api_router.get("/orders")
+async def list_orders(
+    limit: int = 20,
+    offset: int = 0,
+    user: dict = Depends(get_current_user),
+):
+    """List orders with pagination for the active shop."""
+    safe_limit = max(1, min(limit, 100))
+    safe_offset = max(0, offset)
+    query = {"shop_id": user["shop_id"]}
+    if user["role"] != "owner":
+        query["user_id"] = user["id"]
+
+    orders = await db.orders.find(query, {"_id": 0}).to_list(5000)
+    paged = orders[safe_offset : safe_offset + safe_limit]
+    return {
+        "data": normalize_object_ids(paged),
+        "pagination": {"limit": safe_limit, "offset": safe_offset, "total": len(orders)},
+    }
+
+
+@api_router.get("/orders/{order_id}")
+async def get_order(order_id: str, user: dict = Depends(get_current_user)):
+    """Get a single order with items and payments."""
+    if not is_valid_object_id(order_id):
+        raise HTTPException(status_code=400, detail="Invalid ObjectId for order_id")
+
+    query = {"id": order_id, "shop_id": user["shop_id"]}
+    if user["role"] != "owner":
+        query["user_id"] = user["id"]
+    order = await db.orders.find_one(query, {"_id": 0})
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    items = await db.order_items.find({"order_id": order_id, "shop_id": user["shop_id"]}, {"_id": 0}).to_list(1000)
+    payments = await db.payments.find({"order_id": order_id, "shop_id": user["shop_id"]}, {"_id": 0}).to_list(1000)
+    return normalize_object_ids({"order": order, "items": items, "payments": payments})
+
+
+@api_router.patch("/orders/{order_id}")
+async def patch_order_status(
+    order_id: str,
+    data: OrderStatusPatch,
+    owner: dict = Depends(require_owner),
+):
+    """Owner-only order status update."""
+    if not is_valid_object_id(order_id):
+        raise HTTPException(status_code=400, detail="Invalid ObjectId for order_id")
+
+    result = await db.orders.update_one(
+        {"id": order_id, "shop_id": owner["shop_id"]},
+        {"$set": {"status": data.status, "updated_at": datetime.now(timezone.utc).isoformat()}},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Order not found")
+    await write_audit_log(owner["shop_id"], owner["id"], "update_status", "order", order_id, {"status": data.status})
+    order = await db.orders.find_one({"id": order_id, "shop_id": owner["shop_id"]}, {"_id": 0})
+    return normalize_object_ids(order)
+
+
+@api_router.delete("/orders/{order_id}")
+async def cancel_order(order_id: str, user: dict = Depends(get_current_user)):
+    """Cancel an order if it is still pending/processing."""
+    if not is_valid_object_id(order_id):
+        raise HTTPException(status_code=400, detail="Invalid ObjectId for order_id")
+
+    query = {"id": order_id, "shop_id": user["shop_id"]}
+    if user["role"] != "owner":
+        query["user_id"] = user["id"]
+    order = await db.orders.find_one(query, {"_id": 0})
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if order.get("status") not in {"pending", "processing"}:
+        raise HTTPException(status_code=400, detail="Only pending/processing orders can be cancelled")
+
+    await db.orders.update_one(
+        {"id": order_id, "shop_id": user["shop_id"]},
+        {"$set": {"status": "cancelled", "updated_at": datetime.now(timezone.utc).isoformat()}},
+    )
+    await write_audit_log(user["shop_id"], user["id"], "cancel", "order", order_id)
+    return {"message": "Order cancelled", "order_id": order_id}
+
 async def checkout_cart(data: CheckoutRequest, user: dict):
     cart = await db.cart.find_one(
         {"user_id": user["id"], "shop_id": user["shop_id"]}, {"_id": 0}
@@ -2059,12 +2363,18 @@ async def checkout_cart(data: CheckoutRequest, user: dict):
     order_items = []
     total_amount = 0.0
     for item in cart["items"]:
+
+        quantity = item.get("quantity", 0)
+
         product = await db.products.find_one(
             {"id": item["product_id"], "shop_id": user["shop_id"]}, {"_id": 0}
         )
         if not product:
             raise HTTPException(status_code=404, detail="Product not found")
+
+
         quantity = item["quantity"]
+
         if product["stock_quantity"] < quantity:
             raise HTTPException(status_code=400, detail="Insufficient stock")
 
@@ -2084,6 +2394,9 @@ async def checkout_cart(data: CheckoutRequest, user: dict):
                 "quantity": quantity,
                 "unit_price": product.get("unit_price", 0),
                 "total": line_total,
+
+                "item_id": item.get("id"),
+
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
         )
@@ -2099,9 +2412,26 @@ async def checkout_cart(data: CheckoutRequest, user: dict):
         "user_id": user["id"],
         "total_amount": total_amount,
         "status": "completed",
+
+        "customer_id": data.customer_id,
+        "payment_method": data.payment_method,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     await db.orders.insert_one(order)
+
+    if data.payment_method == "credit":
+        if not data.customer_id:
+            raise HTTPException(status_code=400, detail="customer_id is required for credit checkout")
+        await db.credit_customers.update_one(
+            {"id": data.customer_id, "shop_id": user["shop_id"]},
+            {"$inc": {"current_balance": total_amount}},
+        )
+
+    payment_status = "successful" if data.payment_method != "credit" else "on_credit"
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.orders.insert_one(order)
+
     await db.payments.insert_one(
         {
             "id": str(uuid.uuid4()),
@@ -2109,11 +2439,32 @@ async def checkout_cart(data: CheckoutRequest, user: dict):
             "shop_id": user["shop_id"],
             "amount": total_amount,
             "method": data.payment_method,
+
+            "status": payment_status,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    await db.cart.update_one(
+        {"id": cart["id"]},
+        {"$set": {"items": [], "updated_at": datetime.now(timezone.utc).isoformat()}},
+    )
+    return CheckoutResponse(
+        id=order["id"],
+        total_amount=order["total_amount"],
+        shop_id=order["shop_id"],
+        status=order["status"],
+        payment_status=payment_status,
+        payment_method=data.payment_method,
+        customer_id=data.customer_id,
+        items=order_items,
+    )
+
             "status": "successful",
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
     )
     return CheckoutResponse(**order)
+ main
 
 
 async def create_marketplace_order(data: MarketplaceOrderCreate, owner: dict):
