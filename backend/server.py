@@ -417,6 +417,7 @@ class CheckoutRequest(BaseModel):
     payment_method: str
     customer_name: Optional[str] = None
     customer_email: Optional[str] = None
+
     customer_id: Optional[str] = None
 
 
@@ -425,6 +426,7 @@ class CheckoutResponse(BaseModel):
     total_amount: float
     shop_id: str
     status: str
+
     payment_status: str
     payment_method: str
     customer_id: Optional[str] = None
@@ -449,6 +451,7 @@ class MarketplaceDeliveryUpdate(BaseModel):
     notes: Optional[str] = None
 
 
+
 class CartItemCreate(BaseModel):
     product_id: str
     quantity: int = Field(gt=0)
@@ -460,7 +463,6 @@ class CartItemUpdate(BaseModel):
 
 class OrderStatusPatch(BaseModel):
     status: str
-
 
 # =============================================================================
 # HELPER FUNCTIONS
@@ -645,6 +647,7 @@ def build_restock_suggestions(products: List[dict]) -> List[dict]:
                 }
             )
     return suggestions
+
 
 
 def is_valid_object_id(value: str) -> bool:
@@ -2090,6 +2093,7 @@ async def update_shop(data: dict, owner: dict = Depends(require_owner)):
     return shop
 
 
+
 @api_router.get("/cart")
 async def get_cart(user: dict = Depends(get_current_user)):
     """Return the active user's cart with hydrated product details."""
@@ -2349,7 +2353,6 @@ async def cancel_order(order_id: str, user: dict = Depends(get_current_user)):
     await write_audit_log(user["shop_id"], user["id"], "cancel", "order", order_id)
     return {"message": "Order cancelled", "order_id": order_id}
 
-
 async def checkout_cart(data: CheckoutRequest, user: dict):
     cart = await db.cart.find_one(
         {"user_id": user["id"], "shop_id": user["shop_id"]}, {"_id": 0}
@@ -2360,12 +2363,18 @@ async def checkout_cart(data: CheckoutRequest, user: dict):
     order_items = []
     total_amount = 0.0
     for item in cart["items"]:
+
         quantity = item.get("quantity", 0)
+
         product = await db.products.find_one(
             {"id": item["product_id"], "shop_id": user["shop_id"]}, {"_id": 0}
         )
         if not product:
             raise HTTPException(status_code=404, detail="Product not found")
+
+
+        quantity = item["quantity"]
+
         if product["stock_quantity"] < quantity:
             raise HTTPException(status_code=400, detail="Insufficient stock")
 
@@ -2385,7 +2394,9 @@ async def checkout_cart(data: CheckoutRequest, user: dict):
                 "quantity": quantity,
                 "unit_price": product.get("unit_price", 0),
                 "total": line_total,
+
                 "item_id": item.get("id"),
+
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
         )
@@ -2401,6 +2412,7 @@ async def checkout_cart(data: CheckoutRequest, user: dict):
         "user_id": user["id"],
         "total_amount": total_amount,
         "status": "completed",
+
         "customer_id": data.customer_id,
         "payment_method": data.payment_method,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -2416,6 +2428,10 @@ async def checkout_cart(data: CheckoutRequest, user: dict):
         )
 
     payment_status = "successful" if data.payment_method != "credit" else "on_credit"
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.orders.insert_one(order)
+
     await db.payments.insert_one(
         {
             "id": str(uuid.uuid4()),
@@ -2423,6 +2439,7 @@ async def checkout_cart(data: CheckoutRequest, user: dict):
             "shop_id": user["shop_id"],
             "amount": total_amount,
             "method": data.payment_method,
+
             "status": payment_status,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -2441,6 +2458,13 @@ async def checkout_cart(data: CheckoutRequest, user: dict):
         customer_id=data.customer_id,
         items=order_items,
     )
+
+            "status": "successful",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    return CheckoutResponse(**order)
+ main
 
 
 async def create_marketplace_order(data: MarketplaceOrderCreate, owner: dict):
