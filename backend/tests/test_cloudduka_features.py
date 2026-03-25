@@ -424,3 +424,66 @@ class TestCreditReport:
         assert 'summary' in data
         assert 'total_customers' in data['summary']
 
+
+class TestCartAndOrders:
+    def test_cart_crud_and_checkout(self, client, auth_headers):
+        product = client.post('/api/products', json={'name': 'Cart Product', 'unit_price': 120.0, 'stock_quantity': 10}, headers=auth_headers).json()
+
+        add_response = client.post('/api/cart', json={'product_id': product['id'], 'quantity': 2}, headers=auth_headers)
+        assert add_response.status_code == 200, add_response.text
+
+        cart_response = client.get('/api/cart', headers=auth_headers)
+        assert cart_response.status_code == 200
+        cart_payload = cart_response.json()
+        assert len(cart_payload['items']) == 1
+        item_id = cart_payload['items'][0]['id']
+
+        update_response = client.put(f'/api/cart/{item_id}', json={'quantity': 3}, headers=auth_headers)
+        assert update_response.status_code == 200
+
+        checkout = client.post('/api/orders/checkout', json={'payment_method': 'cash'}, headers=auth_headers)
+        assert checkout.status_code == 200, checkout.text
+        assert checkout.json()['order']['total_amount'] == 360.0
+        assert checkout.json()['order']['payment_status'] == 'successful'
+
+    def test_cart_invalid_object_id_and_insufficient_stock(self, client, auth_headers):
+        invalid_response = client.post('/api/cart', json={'product_id': 'bad-id', 'quantity': 1}, headers=auth_headers)
+        assert invalid_response.status_code == 400
+
+        product = client.post('/api/products', json={'name': 'Limited Product', 'unit_price': 50.0, 'stock_quantity': 1}, headers=auth_headers).json()
+        stock_response = client.post('/api/cart', json={'product_id': product['id'], 'quantity': 2}, headers=auth_headers)
+        assert stock_response.status_code == 400
+
+    def test_orders_listing_and_detail_pagination(self, client, auth_headers):
+        product = client.post('/api/products', json={'name': 'Paged Product', 'unit_price': 100.0, 'stock_quantity': 20}, headers=auth_headers).json()
+        client.post('/api/cart', json={'product_id': product['id'], 'quantity': 1}, headers=auth_headers)
+        checkout = client.post('/api/orders/checkout', json={'payment_method': 'cash'}, headers=auth_headers).json()
+        order_id = checkout['order']['id']
+
+        listing = client.get('/api/orders?limit=1&offset=0', headers=auth_headers)
+        assert listing.status_code == 200
+        assert listing.json()['pagination']['limit'] == 1
+        assert listing.json()['pagination']['total'] >= 1
+
+        detail = client.get(f'/api/orders/{order_id}', headers=auth_headers)
+        assert detail.status_code == 200
+        assert detail.json()['order']['id'] == order_id
+
+        invalid_detail = client.get('/api/orders/not-an-id', headers=auth_headers)
+        assert invalid_detail.status_code == 400
+
+    def test_orders_owner_patch_and_cancel_rules(self, client, auth_headers):
+        product = client.post('/api/products', json={'name': 'Patch Product', 'unit_price': 80.0, 'stock_quantity': 10}, headers=auth_headers).json()
+        client.post('/api/cart', json={'product_id': product['id'], 'quantity': 1}, headers=auth_headers)
+        checkout = client.post('/api/orders/checkout', json={'payment_method': 'cash'}, headers=auth_headers).json()
+        order_id = checkout['order']['id']
+
+        patch_response = client.patch(f'/api/orders/{order_id}', json={'status': 'completed'}, headers=auth_headers)
+        assert patch_response.status_code == 200
+
+        cancel_response = client.delete(f'/api/orders/{order_id}', headers=auth_headers)
+        assert cancel_response.status_code == 400
+
+    def test_orders_requires_auth(self, client):
+        response = client.get('/api/orders')
+        assert response.status_code in (401, 403)
