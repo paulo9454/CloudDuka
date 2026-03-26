@@ -18,7 +18,7 @@ import os
 import logging
 from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Literal
 import uuid
 from datetime import datetime, timezone, timedelta
 import jwt
@@ -28,6 +28,9 @@ from fpdf import FPDF
 import base64
 import requests
 import time
+import hmac
+import hashlib
+import json
 from bson import ObjectId
 
 load_dotenv()
@@ -162,8 +165,9 @@ class UserCreate(BaseModel):
     phone: str
     pin: str
     name: str
-    role: str = "shopkeeper"  # owner or shopkeeper
+    role: Literal["owner", "shopkeeper", "customer"] = "customer"
     shop_name: Optional[str] = None
+    shop_id: Optional[str] = None
 
 
 class UserLogin(BaseModel):
@@ -177,7 +181,7 @@ class UserResponse(BaseModel):
     phone: str
     name: str
     role: str
-    shop_id: str
+    shop_id: Optional[str] = None
     trial_ends_at: Optional[str] = None
     subscription_status: str = "trial"
     created_at: str
@@ -192,6 +196,9 @@ class ProductCreate(BaseModel):
     stock_quantity: int = 0
     min_stock_level: int = 5
     unit: str = "piece"
+    image_url: Optional[str] = None
+    description: Optional[str] = None
+    is_active: bool = True
     # Bundle pricing fields
     sell_by: str = "unit"  # "unit" or "bundle"
     bundle_units: Optional[int] = None  # e.g., 3 units per bundle
@@ -208,6 +215,9 @@ class ProductUpdate(BaseModel):
     stock_quantity: Optional[int] = None
     min_stock_level: Optional[int] = None
     unit: Optional[str] = None
+    image_url: Optional[str] = None
+    description: Optional[str] = None
+    is_active: Optional[bool] = None
     sell_by: Optional[str] = None
     bundle_units: Optional[int] = None
     bundle_price: Optional[float] = None
@@ -225,6 +235,9 @@ class ProductResponse(BaseModel):
     stock_quantity: int
     min_stock_level: int
     unit: str
+    image_url: Optional[str] = None
+    description: Optional[str] = None
+    is_active: bool = True
     sell_by: str = "unit"
     bundle_units: Optional[int] = None
     bundle_price: Optional[float] = None
@@ -350,6 +363,20 @@ class PaystackWebhookPayload(BaseModel):
     data: dict
 
 
+class MpesaPaymentInitiateRequest(BaseModel):
+    order_id: str
+    payment_id: Optional[str] = None
+    phone: str
+    amount: Optional[float] = None
+
+
+class MpesaPaymentConfirmRequest(BaseModel):
+    payment_id: str
+    status: Literal["successful", "failed"]
+    checkout_request_id: Optional[str] = None
+    mpesa_receipt: Optional[str] = None
+
+
 class ClientErrorEvent(BaseModel):
     message: str
     source: Optional[str] = None
@@ -433,6 +460,21 @@ class CheckoutResponse(BaseModel):
     items: List[dict] = []
 
 
+class PublicStoreResponse(BaseModel):
+    id: str
+    name: str
+    category: Optional[str] = None
+
+
+class PublicProductResponse(BaseModel):
+    id: str
+    name: str
+    price: float
+    image_url: Optional[str] = None
+    description: Optional[str] = None
+    availability: str
+
+
 class MarketplaceOrderItem(BaseModel):
     product_id: str
     product_name: str
@@ -461,8 +503,60 @@ class CartItemUpdate(BaseModel):
     quantity: int = Field(gt=0)
 
 
+class CustomerCartItemCreate(BaseModel):
+    product_id: str
+    shop_id: str
+    quantity: int = Field(gt=0)
+
+
+class CustomerCartItemUpdate(BaseModel):
+    quantity: int = Field(gt=0)
+
+
+class CustomerCartItemResponse(BaseModel):
+    id: str
+    shop_id: str
+    product_id: str
+    name: str
+    price: float
+    image_url: Optional[str] = None
+    quantity: int
+    created_at: str
+
+
+class CustomerCheckoutRequest(BaseModel):
+    payment_method: str
+    customer_id: Optional[str] = None
+
+
+class CustomerOrderItemResponse(BaseModel):
+    product_id: str
+    name: str
+    quantity: int
+    price: float
+
+
+class CustomerOrderPaymentResponse(BaseModel):
+    method: str
+    status: str
+
+
+class CustomerOrderResponse(BaseModel):
+    order_id: str
+    order_number: str
+    total_amount: float
+    status: str
+    created_at: str
+    items: List[CustomerOrderItemResponse]
+    payment: CustomerOrderPaymentResponse
+
+
 class OrderStatusPatch(BaseModel):
     status: str
+
+
+class OrderLifecycleStatusPatch(BaseModel):
+    status: Literal["pending", "paid", "processing", "ready", "delivered", "cancelled"]
 
 # =============================================================================
 # HELPER FUNCTIONS
@@ -534,8 +628,25 @@ async def get_current_user(
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
 
-        role = user.get("role") or payload.get("role", "shopkeeper")
+        role = user.get("role") or payload.get("role", "owner")
         default_shop_id = user.get("shop_id") or user.get("default_shop_id") or payload.get("shop_id")
+
+        if role == "customer":
+            hydrated_user = {
+                **user,
+                "role": "customer",
+                "shop_id": None,
+                "default_shop_id": None,
+            }
+            if request and request.url.path.startswith("/api/"):
+                if not (
+                    request.url.path.startswith("/api/auth/")
+                    or request.url.path.startswith("/api/public/")
+                    or request.url.path.startswith("/api/customer/")
+                ):
+                    raise HTTPException(status_code=403, detail="Customer access is limited to public/customer endpoints")
+            return hydrated_user
+
         active_shop_id = x_shop_id or payload.get("shop_id") or default_shop_id
 
         if hasattr(db, "shop_users") and active_shop_id:
@@ -557,7 +668,12 @@ async def get_current_user(
             "default_shop_id": user.get("default_shop_id", default_shop_id),
         }
 
-        if request and request.url.path.startswith("/api/") and not request.url.path.startswith("/api/auth/"):
+        if (
+            role == "owner"
+            and request
+            and request.url.path.startswith("/api/")
+            and not request.url.path.startswith("/api/auth/")
+        ):
             await check_subscription(hydrated_user.get("shop_id"))
 
         return hydrated_user
@@ -570,6 +686,18 @@ async def get_current_user(
 def require_owner(user: dict = Depends(get_current_user)):
     if user["role"] != "owner":
         raise HTTPException(status_code=403, detail="Owner access required")
+    return user
+
+
+def require_customer(user: dict = Depends(get_current_user)):
+    if user.get("role") != "customer":
+        raise HTTPException(status_code=403, detail="Customer access required")
+    return user
+
+
+def require_shopkeeper(user: dict = Depends(get_current_user)):
+    if user.get("role") != "shopkeeper":
+        raise HTTPException(status_code=403, detail="Shopkeeper access required")
     return user
 
 
@@ -672,6 +800,131 @@ def normalize_object_ids(payload):
     return payload
 
 
+def normalize_limit_offset(limit: Optional[int], offset: int, default_limit: int = 100, max_limit: int = 200):
+    safe_offset = max(0, offset or 0)
+    if limit is None:
+        return default_limit, safe_offset
+    return max(1, min(limit, max_limit)), safe_offset
+
+
+VALID_ORDER_STATUSES = ["pending", "paid", "processing", "ready", "delivered", "cancelled"]
+VALID_ORDER_TRANSITIONS = {
+    "pending": ["paid", "cancelled"],
+    "paid": ["processing", "cancelled"],
+    "processing": ["ready"],
+    "ready": ["delivered"],
+    "delivered": [],
+    "cancelled": [],
+}
+
+
+def get_order_lifecycle_status(order: dict) -> str:
+    return (order.get("lifecycle_status") or order.get("status") or "pending").lower()
+
+
+def build_status_history_entry(status_value: str):
+    return {"status": status_value, "timestamp": datetime.now(timezone.utc).isoformat()}
+
+
+def get_order_status_history(order: dict):
+    if order.get("status_history"):
+        return order["status_history"]
+    return [
+        {
+            "status": get_order_lifecycle_status(order),
+            "timestamp": order.get("created_at"),
+        }
+    ]
+
+
+async def ensure_order_lifecycle_initialized(order: dict):
+    if not order or order.get("lifecycle_status"):
+        return
+    fallback_entry = {
+        "status": "pending",
+        "timestamp": order.get("created_at"),
+    }
+    await db.orders.update_one(
+        {"id": order["id"], "shop_id": order.get("shop_id")},
+        {
+            "$set": {
+                "lifecycle_status": "pending",
+                "status": "pending",
+            },
+            "$push": {"status_history": fallback_entry},
+        },
+    )
+    order["lifecycle_status"] = "pending"
+    order["status"] = "pending"
+    order["status_history"] = [fallback_entry]
+
+
+async def initialize_order_lifecycle(order_id: str, shop_id: str):
+    order = await db.orders.find_one({"id": order_id, "shop_id": shop_id}, {"_id": 0})
+    if not order:
+        return
+    await ensure_order_lifecycle_initialized(order)
+
+
+async def set_order_lifecycle_status(
+    order_id: str,
+    shop_id: str,
+    new_status: str,
+    enforce_transition: bool = True,
+):
+    order = await db.orders.find_one({"id": order_id, "shop_id": shop_id}, {"_id": 0})
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    new_status = (new_status or "").lower()
+    if new_status not in VALID_ORDER_STATUSES:
+        raise HTTPException(status_code=400, detail="Invalid order status")
+
+    current_status = get_order_lifecycle_status(order)
+    if current_status not in VALID_ORDER_TRANSITIONS:
+        raise HTTPException(status_code=400, detail="Invalid current state")
+    if enforce_transition and new_status not in VALID_ORDER_TRANSITIONS.get(current_status, []):
+        raise HTTPException(status_code=400, detail=f"Invalid status transition: {current_status} -> {new_status}")
+    if current_status == new_status:
+        return order
+
+    history = list(get_order_status_history(order))
+    history.append(build_status_history_entry(new_status))
+    await db.orders.update_one(
+        {"id": order_id, "shop_id": shop_id},
+        {"$set": {"lifecycle_status": new_status, "status": new_status, "status_history": history, "updated_at": datetime.now(timezone.utc).isoformat()}},
+    )
+    order["lifecycle_status"] = new_status
+    order["status"] = new_status
+    order["status_history"] = history
+    return order
+
+
+async def get_stored_checkout_response(user_id: str, key: Optional[str]):
+    if not key or not hasattr(db, "checkout_requests"):
+        return None
+    stored = await db.checkout_requests.find_one({"key": key, "user_id": user_id}, {"_id": 0})
+    if stored and stored.get("response"):
+        return stored["response"]
+    return None
+
+
+async def store_checkout_response(user_id: str, key: Optional[str], response_payload: dict):
+    if not key or not hasattr(db, "checkout_requests"):
+        return
+    await db.checkout_requests.update_one(
+        {"key": key, "user_id": user_id},
+        {
+            "$set": {
+                "response": response_payload,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            },
+            "$setOnInsert": {"key": key, "user_id": user_id},
+        },
+        upsert=True,
+    )
+
+
 async def write_audit_log(
     shop_id: str,
     user_id: str,
@@ -741,6 +994,17 @@ async def register(data: UserCreate):
             "created_at": now.isoformat(),
         }
 
+    # CUSTOMER (default)
+    elif data.role == "customer":
+        user = {
+            "id": user_id,
+            "phone": data.phone,
+            "pin_hash": hash_pin(data.pin),
+            "name": data.name,
+            "role": "customer",
+            "created_at": now.isoformat(),
+        }
+
     else:
         raise HTTPException(status_code=400, detail="Invalid role")
 
@@ -802,12 +1066,21 @@ async def login(data: UserLogin):
         membership = await db.shop_users.find_one(
             {"user_id": user["id"], "shop_id": default_shop_id}, {"_id": 0}
         )
-    role = user.get("role") or (membership.get("role") if membership else "shopkeeper")
+    role = user.get("role") or (membership.get("role") if membership else "owner")
     token = create_token(user["id"], default_shop_id, role)
 
     return {
         "token": token,
-        "user": {**user, "role": role, "shop_id": default_shop_id}
+        "user": {
+            "id": user["id"],
+            "phone": user["phone"],
+            "name": user["name"],
+            "role": role,
+            "shop_id": default_shop_id,
+            "trial_ends_at": user.get("trial_ends_at"),
+            "subscription_status": user.get("subscription_status", "trial"),
+            "created_at": user["created_at"],
+        },
     }
 
 
@@ -864,6 +1137,9 @@ async def create_product(
         "stock_quantity": data.stock_quantity,
         "min_stock_level": data.min_stock_level,
         "unit": data.unit,
+        "image_url": data.image_url,
+        "description": data.description,
+        "is_active": data.is_active,
         "shop_id": shop_id,
         "created_at": now,
         "updated_at": now,
@@ -1067,26 +1343,27 @@ async def create_sale(
     if data.payment_method == "credit" and not data.customer_id:
         raise HTTPException(400, "Customer required for credit sales")
 
-    # Check stock
+    # Atomic stock update with oversell protection
     for item in data.items:
-        product = await db.products.find_one(
-            {"id": item.product_id, "shop_id": shop_id}
-        )
-        if not product:
-            raise HTTPException(404, f"Product {item.product_id} not found")
-
-        if product["stock_quantity"] < item.quantity:
-            raise HTTPException(
-                400,
-                f"Insufficient stock for {product['name']}. Available: {product['stock_quantity']}",
-            )
-
-    # Update stock
-    for item in data.items:
-        await db.products.update_one(
-            {"id": item.product_id, "shop_id": shop_id},
+        stock_update = await db.products.update_one(
+            {
+                "id": item.product_id,
+                "shop_id": shop_id,
+                "stock_quantity": {"$gte": item.quantity},
+            },
             {"$inc": {"stock_quantity": -item.quantity}},
         )
+        if stock_update.matched_count == 0:
+            product = await db.products.find_one(
+                {"id": item.product_id, "shop_id": shop_id},
+                {"_id": 0},
+            )
+            if not product:
+                raise HTTPException(404, f"Product {item.product_id} not found")
+            raise HTTPException(
+                400,
+                f"Insufficient stock for {product.get('name', item.product_id)}. Available: {product.get('stock_quantity', 0)}",
+            )
 
     # Credit balance
     if data.payment_method == "credit" and data.customer_id:
@@ -1281,9 +1558,16 @@ async def create_damaged_stock(
         raise HTTPException(status_code=400, detail="Insufficient stock")
 
     # Reduce stock
-    await db.products.update_one(
-        {"id": data.product_id}, {"$inc": {"stock_quantity": -data.quantity}}
+    stock_update = await db.products.update_one(
+        {
+            "id": data.product_id,
+            "shop_id": user["shop_id"],
+            "stock_quantity": {"$gte": data.quantity},
+        },
+        {"$inc": {"stock_quantity": -data.quantity}},
     )
+    if stock_update.matched_count == 0:
+        raise HTTPException(status_code=400, detail="Insufficient stock")
 
     # Record damaged stock
     damaged_id = str(uuid.uuid4())
@@ -1416,6 +1700,202 @@ async def mpesa_check_status(
         "status": transaction["status"],
         "mpesa_receipt": transaction.get("mpesa_receipt"),
     }
+
+
+def _normalize_payment_method(method: str) -> str:
+    method = (method or "").lower()
+    return method if method in {"cash", "mpesa", "paystack", "credit"} else method
+
+
+def _normalize_payment_status(status: str) -> str:
+    status = (status or "").lower()
+    if status in {"pending", "successful", "failed"}:
+        return status
+    if status in {"on_credit"}:
+        return "pending"
+    return status
+
+
+async def _set_payment_status_if_pending(
+    payment_id: str,
+    shop_id: str,
+    new_status: str,
+    extra_fields: Optional[dict] = None,
+):
+    new_status = _normalize_payment_status(new_status)
+    update_payload = {"status": new_status, "updated_at": datetime.now(timezone.utc).isoformat()}
+    if extra_fields:
+        update_payload.update(extra_fields)
+
+    result = await db.payments.update_one(
+        {"id": payment_id, "shop_id": shop_id, "status": "pending"},
+        {"$set": update_payload},
+    )
+    if result.matched_count == 1:
+        logger.info("Payment status updated payment_id=%s shop_id=%s status=%s", payment_id, shop_id, new_status)
+        if new_status == "successful":
+            payment = await db.payments.find_one({"id": payment_id, "shop_id": shop_id}, {"_id": 0})
+            if payment and payment.get("order_id"):
+                order = await db.orders.find_one({"id": payment["order_id"], "shop_id": shop_id}, {"_id": 0})
+                if order and get_order_lifecycle_status(order) == "pending":
+                    await set_order_lifecycle_status(payment["order_id"], shop_id, "paid", enforce_transition=False)
+        return {"updated": True, "status": new_status}
+
+    existing = await db.payments.find_one({"id": payment_id, "shop_id": shop_id}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    if _normalize_payment_status(existing.get("status")) == "successful":
+        return {"updated": False, "status": "successful", "message": "Payment already successful"}
+    return {"updated": False, "status": existing.get("status"), "message": "Payment status not updated"}
+
+
+def verify_paystack_signature(raw_body: bytes, signature: str, secret: str) -> bool:
+    if not signature or not secret:
+        return False
+    digest = hmac.new(secret.encode(), raw_body, hashlib.sha512).hexdigest()
+    return hmac.compare_digest(digest, signature)
+
+
+async def handle_paystack_webhook_event(payload: dict):
+    event = payload.get("event")
+    data = payload.get("data", {}) or {}
+    reference = data.get("reference")
+    if event != "charge.success" or not reference:
+        return {"received": True}
+
+    payment = await db.payments.find_one({"paystack_reference": reference}, {"_id": 0})
+    if not payment:
+        metadata = data.get("metadata", {}) or {}
+        order_id = metadata.get("order_id")
+        if order_id:
+            payment = await db.payments.find_one({"order_id": order_id}, {"_id": 0})
+    if not payment:
+        return {"received": True}
+
+    update = await _set_payment_status_if_pending(
+        payment_id=payment["id"],
+        shop_id=payment["shop_id"],
+        new_status="successful",
+        extra_fields={"method": "paystack", "paystack_reference": reference},
+    )
+    return {"received": True, "payment_id": payment["id"], "status": update.get("status")}
+
+
+@api_router.post("/payments/mpesa/initiate")
+async def payments_mpesa_initiate(
+    data: MpesaPaymentInitiateRequest,
+    user: dict = Depends(get_current_user),
+):
+    order = await db.orders.find_one({"id": data.order_id, "shop_id": user["shop_id"]}, {"_id": 0})
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    payment_query = {"order_id": data.order_id, "shop_id": user["shop_id"]}
+    if data.payment_id:
+        payment_query["id"] = data.payment_id
+    payment = await db.payments.find_one(payment_query, {"_id": 0})
+    if not payment:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    if payment.get("order_id") != data.order_id:
+        raise HTTPException(status_code=400, detail="Payment is not linked to the order")
+
+    if _normalize_payment_status(payment.get("status")) == "successful":
+        return {"message": "Payment already successful", "payment_id": payment["id"], "status": "successful"}
+
+    amount = data.amount if data.amount is not None else payment.get("amount", order.get("total_amount", 0))
+    checkout_request_id = f"ws_PAY_{datetime.now().strftime('%Y%m%d%H%M%S')}_{str(uuid.uuid4())[:8]}"
+
+    await db.payments.update_one(
+        {"id": payment["id"], "shop_id": user["shop_id"]},
+        {
+            "$set": {
+                "method": "mpesa",
+                "status": "pending",
+                "mpesa_checkout_request_id": checkout_request_id,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        },
+    )
+
+    await db.mpesa_transactions.insert_one(
+        {
+            "id": str(uuid.uuid4()),
+            "checkout_request_id": checkout_request_id,
+            "merchant_request_id": f"MR_{str(uuid.uuid4())[:12]}",
+            "order_id": data.order_id,
+            "payment_id": payment["id"],
+            "phone": data.phone,
+            "amount": amount,
+            "status": "pending",
+            "provider": "mpesa",
+            "shop_id": user["shop_id"],
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    return {
+        "payment_id": payment["id"],
+        "order_id": data.order_id,
+        "checkout_request_id": checkout_request_id,
+        "status": "pending",
+    }
+
+
+@api_router.post("/payments/mpesa/confirm")
+async def payments_mpesa_confirm(
+    data: MpesaPaymentConfirmRequest,
+    user: dict = Depends(get_current_user),
+):
+    payment = await db.payments.find_one({"id": data.payment_id, "shop_id": user["shop_id"]}, {"_id": 0})
+    if not payment:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    if _normalize_payment_method(payment.get("method")) not in {"mpesa", "paystack", "cash", "credit"}:
+        raise HTTPException(status_code=400, detail="Unsupported payment method")
+
+    status_update = await _set_payment_status_if_pending(
+        payment_id=data.payment_id,
+        shop_id=user["shop_id"],
+        new_status=data.status,
+        extra_fields={
+            "method": "mpesa",
+            "mpesa_receipt": data.mpesa_receipt,
+            "mpesa_checkout_request_id": data.checkout_request_id or payment.get("mpesa_checkout_request_id"),
+        },
+    )
+
+    if data.checkout_request_id:
+        await db.mpesa_transactions.update_one(
+            {"checkout_request_id": data.checkout_request_id, "shop_id": user["shop_id"]},
+            {"$set": {"status": data.status, "mpesa_receipt": data.mpesa_receipt}},
+        )
+
+    return {"payment_id": data.payment_id, **status_update}
+
+
+@api_router.get("/payments/{payment_id}/status")
+async def get_payment_status(payment_id: str, user: dict = Depends(get_current_user)):
+    payment = await db.payments.find_one({"id": payment_id, "shop_id": user["shop_id"]}, {"_id": 0})
+    if not payment:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    return {
+        "id": payment["id"],
+        "order_id": payment.get("order_id"),
+        "method": _normalize_payment_method(payment.get("method")),
+        "status": _normalize_payment_status(payment.get("status")),
+    }
+
+
+@api_router.post("/payments/paystack/webhook")
+async def payments_paystack_webhook(
+    request: Request,
+    x_paystack_signature: Optional[str] = Header(default=None, alias="x-paystack-signature"),
+):
+    raw_body = await request.body()
+    secret = os.environ.get("PAYSTACK_WEBHOOK_SECRET")
+    if not verify_paystack_signature(raw_body, x_paystack_signature or "", secret or ""):
+        raise HTTPException(status_code=400, detail="Invalid webhook signature")
+    payload = json.loads(raw_body.decode("utf-8"))
+    logger.info("Paystack webhook received path=/payments/paystack/webhook")
+    return await handle_paystack_webhook_event(payload)
 
 
 # =============================================================================
@@ -1947,7 +2427,7 @@ async def create_purchase(data: PurchaseCreate, user: dict = Depends(get_current
         # Update product stock and cost price
         cost_per_unit = item.cost / total_units if total_units > 0 else 0
         await db.products.update_one(
-            {"id": item.product_id},
+            {"id": item.product_id, "shop_id": user["shop_id"]},
             {
                 "$inc": {"stock_quantity": total_units},
                 "$set": {"cost_price": cost_per_unit, "updated_at": now},
@@ -2091,6 +2571,286 @@ async def update_shop(data: dict, owner: dict = Depends(require_owner)):
     )
     shop = await db.shops.find_one({"id": owner["shop_id"]}, {"_id": 0})
     return shop
+
+
+def build_customer_cart_item_response(item: dict, product: dict) -> CustomerCartItemResponse:
+    return CustomerCartItemResponse(
+        id=item["id"],
+        shop_id=item["shop_id"],
+        product_id=item["product_id"],
+        name=product.get("name", ""),
+        price=product.get("unit_price", 0),
+        image_url=product.get("image_url"),
+        quantity=item.get("quantity", 0),
+        created_at=item.get("created_at", datetime.now(timezone.utc).isoformat()),
+    )
+
+
+def build_customer_order_response(order: dict, order_items: List[dict], payment: Optional[dict]) -> CustomerOrderResponse:
+    items: List[CustomerOrderItemResponse] = []
+    for item in order_items:
+        items.append(
+            CustomerOrderItemResponse(
+                product_id=item.get("product_id", ""),
+                name=item.get("product_name") or item.get("name") or "Unknown Product",
+                quantity=item.get("quantity", 0),
+                price=item.get("unit_price", 0),
+            )
+        )
+
+    payment_payload = CustomerOrderPaymentResponse(
+        method=(payment or {}).get("method", "unknown"),
+        status=(payment or {}).get("status", "unknown"),
+    )
+
+    return CustomerOrderResponse(
+        order_id=order["id"],
+        order_number=order.get("order_number") or order["id"],
+        total_amount=order.get("total_amount", 0),
+        status=get_order_lifecycle_status(order),
+        created_at=order.get("created_at", ""),
+        items=items,
+        payment=payment_payload,
+    )
+
+
+@api_router.post("/customer/cart", response_model=CustomerCartItemResponse)
+async def customer_add_to_cart(
+    data: CustomerCartItemCreate,
+    customer: dict = Depends(require_customer),
+):
+    shop = await db.shops.find_one({"id": data.shop_id}, {"_id": 0})
+    if not shop:
+        raise HTTPException(status_code=404, detail="Shop not found")
+
+    product = await db.products.find_one(
+        {"id": data.product_id, "shop_id": data.shop_id},
+        {"_id": 0},
+    )
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+    if not product.get("is_active", True):
+        raise HTTPException(status_code=400, detail="Product is not active")
+
+    existing = await db.customer_cart.find_one(
+        {
+            "user_id": customer["id"],
+            "product_id": data.product_id,
+            "shop_id": data.shop_id,
+        },
+        {"_id": 0},
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    if existing:
+        new_quantity = existing.get("quantity", 0) + data.quantity
+        await db.customer_cart.update_one(
+            {"id": existing["id"], "user_id": customer["id"]},
+            {"$set": {"quantity": new_quantity, "updated_at": now}},
+        )
+        existing["quantity"] = new_quantity
+        existing["updated_at"] = now
+        return build_customer_cart_item_response(existing, product)
+
+    cart_item = {
+        "id": str(uuid.uuid4()),
+        "user_id": customer["id"],
+        "product_id": data.product_id,
+        "shop_id": data.shop_id,
+        "quantity": data.quantity,
+        "created_at": now,
+    }
+    await db.customer_cart.insert_one(cart_item)
+    return build_customer_cart_item_response(cart_item, product)
+
+
+@api_router.get("/customer/cart", response_model=List[CustomerCartItemResponse])
+async def customer_get_cart(customer: dict = Depends(require_customer)):
+    items = await db.customer_cart.find({"user_id": customer["id"]}, {"_id": 0}).to_list(1000)
+    response_items: List[CustomerCartItemResponse] = []
+    for item in items:
+        product = await db.products.find_one(
+            {"id": item["product_id"], "shop_id": item["shop_id"]},
+            {"_id": 0},
+        )
+        if not product or not product.get("is_active", True):
+            continue
+        response_items.append(build_customer_cart_item_response(item, product))
+    return response_items
+
+
+@api_router.put("/customer/cart/{item_id}", response_model=CustomerCartItemResponse)
+async def customer_update_cart_item(
+    item_id: str,
+    data: CustomerCartItemUpdate,
+    customer: dict = Depends(require_customer),
+):
+    item = await db.customer_cart.find_one({"id": item_id, "user_id": customer["id"]}, {"_id": 0})
+    if not item:
+        raise HTTPException(status_code=404, detail="Cart item not found")
+
+    product = await db.products.find_one(
+        {"id": item["product_id"], "shop_id": item["shop_id"]},
+        {"_id": 0},
+    )
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+    if not product.get("is_active", True):
+        raise HTTPException(status_code=400, detail="Product is not active")
+
+    await db.customer_cart.update_one(
+        {"id": item_id, "user_id": customer["id"]},
+        {"$set": {"quantity": data.quantity, "updated_at": datetime.now(timezone.utc).isoformat()}},
+    )
+    item["quantity"] = data.quantity
+    return build_customer_cart_item_response(item, product)
+
+
+@api_router.delete("/customer/cart/{item_id}")
+async def customer_delete_cart_item(item_id: str, customer: dict = Depends(require_customer)):
+    result = await db.customer_cart.delete_one({"id": item_id, "user_id": customer["id"]})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Cart item not found")
+    return {"message": "Cart item removed"}
+
+
+@api_router.post("/customer/checkout")
+async def customer_checkout(
+    data: CustomerCheckoutRequest,
+    request: Request,
+    customer: dict = Depends(require_customer),
+):
+    idem_key = request.headers.get("Idempotency-Key")
+    existing_response = await get_stored_checkout_response(customer["id"], idem_key)
+    if existing_response:
+        return existing_response
+
+    logger.info("Checkout start flow=customer user_id=%s", customer["id"])
+    customer_items = await db.customer_cart.find({"user_id": customer["id"]}, {"_id": 0}).to_list(1000)
+    if not customer_items:
+        raise HTTPException(status_code=400, detail="Customer cart is empty")
+
+    shop_ids = {item["shop_id"] for item in customer_items}
+    if len(shop_ids) != 1:
+        raise HTTPException(status_code=400, detail="Customer cart must contain items from one shop")
+    checkout_shop_id = next(iter(shop_ids))
+
+    pos_cart_items = []
+    for item in customer_items:
+        product = await db.products.find_one(
+            {"id": item["product_id"], "shop_id": checkout_shop_id},
+            {"_id": 0},
+        )
+        if not product:
+            raise HTTPException(status_code=404, detail=f"Product {item['product_id']} not found")
+        if not product.get("is_active", True):
+            raise HTTPException(status_code=400, detail=f"Product {item['product_id']} is not active")
+        if product.get("stock_quantity", 0) < item["quantity"]:
+            raise HTTPException(status_code=400, detail=f"Insufficient stock for {product.get('name', item['product_id'])}")
+
+        pos_cart_items.append(
+            {
+                "id": item["id"],
+                "product_id": item["product_id"],
+                "quantity": item["quantity"],
+                "created_at": item.get("created_at", datetime.now(timezone.utc).isoformat()),
+            }
+        )
+
+    cart = await db.cart.find_one(
+        {"user_id": customer["id"], "shop_id": checkout_shop_id},
+        {"_id": 0},
+    )
+    cart_id = cart["id"] if cart else str(uuid.uuid4())
+    await db.cart.update_one(
+        {"id": cart_id},
+        {
+            "$set": {
+                "user_id": customer["id"],
+                "shop_id": checkout_shop_id,
+                "items": pos_cart_items,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            "$setOnInsert": {"id": cart_id},
+        },
+        upsert=True,
+    )
+
+    checkout_user = {**customer, "shop_id": checkout_shop_id}
+    try:
+        checkout_result = await checkout_cart(
+            CheckoutRequest(
+                payment_method=data.payment_method,
+                customer_id=data.customer_id,
+            ),
+            checkout_user,
+        )
+    except Exception:
+        logger.exception("Checkout failure flow=customer user_id=%s", customer["id"])
+        raise
+
+    await db.orders.update_one(
+        {"id": checkout_result.id, "shop_id": checkout_shop_id},
+        {"$set": {"source": "customer_app"}},
+    )
+    await initialize_order_lifecycle(checkout_result.id, checkout_shop_id)
+    await db.customer_cart.delete_many({"user_id": customer["id"]})
+    response_payload = {"order": checkout_result.model_dump(), "items": checkout_result.items}
+    await store_checkout_response(customer["id"], idem_key, response_payload)
+    logger.info("Checkout success flow=customer user_id=%s order_id=%s", customer["id"], checkout_result.id)
+    return response_payload
+
+
+@api_router.get("/customer/orders", response_model=List[CustomerOrderResponse])
+async def customer_list_orders(
+    limit: Optional[int] = None,
+    offset: int = 0,
+    customer: dict = Depends(require_customer),
+):
+    safe_limit, safe_offset = normalize_limit_offset(limit, offset, default_limit=200, max_limit=500)
+    orders = await db.orders.find(
+        {"user_id": customer["id"]},
+        {"_id": 0},
+    ).sort("created_at", -1).skip(safe_offset).limit(safe_limit).to_list(safe_limit)
+
+    order_ids = [order["id"] for order in orders]
+    if not order_ids:
+        return []
+
+    order_items_list = await db.order_items.find({"order_id": {"$in": order_ids}}, {"_id": 0}).to_list(5000)
+    payments_list = await db.payments.find({"order_id": {"$in": order_ids}}, {"_id": 0}).to_list(5000)
+
+    items_by_order: Dict[str, List[dict]] = {}
+    for item in order_items_list:
+        items_by_order.setdefault(item.get("order_id"), []).append(item)
+
+    payment_by_order: Dict[str, dict] = {}
+    for payment in payments_list:
+        order_id = payment.get("order_id")
+        if order_id and order_id not in payment_by_order:
+            payment_by_order[order_id] = payment
+
+    response: List[CustomerOrderResponse] = []
+    for order in orders:
+        await ensure_order_lifecycle_initialized(order)
+        order_items = items_by_order.get(order["id"], [])
+        payment = payment_by_order.get(order["id"])
+        response.append(build_customer_order_response(order, order_items, payment))
+    return response
+
+
+@api_router.get("/customer/orders/{order_id}", response_model=CustomerOrderResponse)
+async def customer_get_order(order_id: str, customer: dict = Depends(require_customer)):
+    order = await db.orders.find_one(
+        {"id": order_id, "user_id": customer["id"]},
+        {"_id": 0},
+    )
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    await ensure_order_lifecycle_initialized(order)
+
+    order_items = await db.order_items.find({"order_id": order["id"]}, {"_id": 0}).to_list(1000)
+    payment = await db.payments.find_one({"order_id": order["id"]}, {"_id": 0})
+    return build_customer_order_response(order, order_items, payment)
 
 
 
@@ -2257,7 +3017,11 @@ async def delete_cart_item(item_id: str, user: dict = Depends(get_current_user))
 
 
 @api_router.post("/orders/checkout")
-async def checkout_order(data: CheckoutRequest, user: dict = Depends(get_current_user)):
+async def checkout_order(
+    data: CheckoutRequest,
+    request: Request,
+    user: dict = Depends(get_current_user),
+):
     """Create an order from cart items and record payment.
 
     Example response:
@@ -2266,9 +3030,23 @@ async def checkout_order(data: CheckoutRequest, user: dict = Depends(get_current
       "items": [{"product_id": "...", "quantity": 2}]
     }
     """
-    result = await checkout_cart(data, user)
+    idem_key = request.headers.get("Idempotency-Key")
+    existing_response = await get_stored_checkout_response(user["id"], idem_key)
+    if existing_response:
+        return existing_response
+
+    logger.info("Checkout start flow=pos user_id=%s shop_id=%s", user["id"], user.get("shop_id"))
+    try:
+        result = await checkout_cart(data, user)
+    except Exception:
+        logger.exception("Checkout failure flow=pos user_id=%s shop_id=%s", user["id"], user.get("shop_id"))
+        raise
+    await initialize_order_lifecycle(result.id, user["shop_id"])
     await write_audit_log(user["shop_id"], user["id"], "checkout", "order", result.id, {"payment_method": data.payment_method})
-    return {"order": result.model_dump(), "items": result.items}
+    response_payload = {"order": result.model_dump(), "items": result.items}
+    await store_checkout_response(user["id"], idem_key, response_payload)
+    logger.info("Checkout success flow=pos user_id=%s order_id=%s", user["id"], result.id)
+    return response_payload
 
 
 @api_router.get("/orders")
@@ -2286,6 +3064,10 @@ async def list_orders(
 
     orders = await db.orders.find(query, {"_id": 0}).to_list(5000)
     paged = orders[safe_offset : safe_offset + safe_limit]
+    for order in paged:
+        await ensure_order_lifecycle_initialized(order)
+        order["status"] = get_order_lifecycle_status(order)
+        order["status_history"] = get_order_status_history(order)
     return {
         "data": normalize_object_ids(paged),
         "pagination": {"limit": safe_limit, "offset": safe_offset, "total": len(orders)},
@@ -2304,6 +3086,9 @@ async def get_order(order_id: str, user: dict = Depends(get_current_user)):
     order = await db.orders.find_one(query, {"_id": 0})
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
+    await ensure_order_lifecycle_initialized(order)
+    order["status"] = get_order_lifecycle_status(order)
+    order["status_history"] = get_order_status_history(order)
 
     items = await db.order_items.find({"order_id": order_id, "shop_id": user["shop_id"]}, {"_id": 0}).to_list(1000)
     payments = await db.payments.find({"order_id": order_id, "shop_id": user["shop_id"]}, {"_id": 0}).to_list(1000)
@@ -2320,15 +3105,71 @@ async def patch_order_status(
     if not is_valid_object_id(order_id):
         raise HTTPException(status_code=400, detail="Invalid ObjectId for order_id")
 
-    result = await db.orders.update_one(
-        {"id": order_id, "shop_id": owner["shop_id"]},
-        {"$set": {"status": data.status, "updated_at": datetime.now(timezone.utc).isoformat()}},
-    )
-    if result.matched_count == 0:
+    order = await db.orders.find_one({"id": order_id, "shop_id": owner["shop_id"]}, {"_id": 0})
+    if not order:
         raise HTTPException(status_code=404, detail="Order not found")
+
+    if (data.status or "").lower() in VALID_ORDER_STATUSES:
+        await set_order_lifecycle_status(order_id, owner["shop_id"], data.status, enforce_transition=False)
+    else:
+        await db.orders.update_one(
+            {"id": order_id, "shop_id": owner["shop_id"]},
+            {
+                "$set": {
+                    "status": data.status,
+                    "lifecycle_status": data.status,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            },
+        )
     await write_audit_log(owner["shop_id"], owner["id"], "update_status", "order", order_id, {"status": data.status})
     order = await db.orders.find_one({"id": order_id, "shop_id": owner["shop_id"]}, {"_id": 0})
+    await ensure_order_lifecycle_initialized(order)
+    order["status"] = get_order_lifecycle_status(order)
+    order["status_history"] = get_order_status_history(order)
     return normalize_object_ids(order)
+
+
+@api_router.patch("/orders/{order_id}/status")
+async def patch_order_lifecycle_status(
+    order_id: str,
+    data: OrderLifecycleStatusPatch,
+    user: dict = Depends(get_current_user),
+):
+    if user.get("role") not in {"owner", "shopkeeper"}:
+        raise HTTPException(status_code=403, detail="Owner or shopkeeper access required")
+    if not is_valid_object_id(order_id):
+        raise HTTPException(status_code=400, detail="Invalid ObjectId for order_id")
+
+    order = await db.orders.find_one({"id": order_id, "shop_id": user["shop_id"]}, {"_id": 0})
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    updated = await set_order_lifecycle_status(order_id, user["shop_id"], data.status, enforce_transition=True)
+    logger.info(
+        {
+            "event": "order_status_changed",
+            "order_id": order_id,
+            "from": get_order_lifecycle_status(order),
+            "to": data.status,
+            "user_id": user["id"],
+        }
+    )
+    await write_audit_log(
+        user["shop_id"],
+        user["id"],
+        "update_lifecycle_status",
+        "order",
+        order_id,
+        {"status": data.status},
+    )
+    return normalize_object_ids(
+        {
+            "id": updated["id"],
+            "status": get_order_lifecycle_status(updated),
+            "status_history": get_order_status_history(updated),
+        }
+    )
 
 
 @api_router.delete("/orders/{order_id}")
@@ -2343,142 +3184,209 @@ async def cancel_order(order_id: str, user: dict = Depends(get_current_user)):
     order = await db.orders.find_one(query, {"_id": 0})
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
-    if order.get("status") not in {"pending", "processing"}:
+    await ensure_order_lifecycle_initialized(order)
+    current_status = get_order_lifecycle_status(order)
+    if current_status not in {"pending", "paid", "processing"}:
         raise HTTPException(status_code=400, detail="Only pending/processing orders can be cancelled")
-
-    await db.orders.update_one(
-        {"id": order_id, "shop_id": user["shop_id"]},
-        {"$set": {"status": "cancelled", "updated_at": datetime.now(timezone.utc).isoformat()}},
-    )
+    await set_order_lifecycle_status(order_id, user["shop_id"], "cancelled", enforce_transition=False)
     await write_audit_log(user["shop_id"], user["id"], "cancel", "order", order_id)
     return {"message": "Order cancelled", "order_id": order_id}
 
 async def checkout_cart(data: CheckoutRequest, user: dict):
-    cart = await db.cart.find_one(
-        {"user_id": user["id"], "shop_id": user["shop_id"]}, {"_id": 0}
-    )
-    if not cart or not cart.get("items"):
-        raise HTTPException(status_code=400, detail="Cart is empty")
-
-    order_items = []
-    total_amount = 0.0
-    for item in cart["items"]:
-
-        quantity = item.get("quantity", 0)
-
-        product = await db.products.find_one(
-            {"id": item["product_id"], "shop_id": user["shop_id"]}, {"_id": 0}
+    async def _run_checkout(session=None):
+        cart = await db.cart.find_one(
+            {"user_id": user["id"], "shop_id": user["shop_id"]}, {"_id": 0}
         )
-        if not product:
-            raise HTTPException(status_code=404, detail="Product not found")
+        if not cart or not cart.get("items"):
+            raise HTTPException(status_code=400, detail="Cart is empty")
 
+        order_items = []
+        total_amount = 0.0
+        for item in cart["items"]:
+            quantity = item["quantity"]
+            product = await db.products.find_one(
+                {"id": item["product_id"], "shop_id": user["shop_id"]}, {"_id": 0}
+            )
+            if not product:
+                raise HTTPException(status_code=404, detail="Product not found")
 
-        quantity = item["quantity"]
+            stock_update = await db.products.update_one(
+                {
+                    "id": product["id"],
+                    "shop_id": user["shop_id"],
+                    "stock_quantity": {"$gte": quantity},
+                },
+                {"$inc": {"stock_quantity": -quantity}},
+                session=session,
+            )
+            if stock_update.matched_count == 0:
+                raise HTTPException(status_code=400, detail="Insufficient stock")
 
-        if product["stock_quantity"] < quantity:
-            raise HTTPException(status_code=400, detail="Insufficient stock")
+            line_total = product.get("unit_price", 0) * quantity
+            total_amount += line_total
+            order_items.append(
+                {
+                    "id": str(uuid.uuid4()),
+                    "order_id": None,
+                    "shop_id": user["shop_id"],
+                    "product_id": product["id"],
+                    "product_name": product.get("name"),
+                    "quantity": quantity,
+                    "unit_price": product.get("unit_price", 0),
+                    "total": line_total,
+                    "item_id": item.get("id"),
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
 
-        await db.products.update_one(
-            {"id": product["id"], "shop_id": user["shop_id"]},
-            {"$inc": {"stock_quantity": -quantity}},
-        )
-        line_total = product.get("unit_price", 0) * quantity
-        total_amount += line_total
-        order_items.append(
+        order_id = str(uuid.uuid4())
+        for order_item in order_items:
+            order_item["order_id"] = order_id
+            await db.order_items.insert_one(order_item, session=session)
+
+        order = {
+            "id": order_id,
+            "shop_id": user["shop_id"],
+            "user_id": user["id"],
+            "total_amount": total_amount,
+            "status": "completed",
+            "customer_id": data.customer_id,
+            "payment_method": data.payment_method,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        await db.orders.insert_one(order, session=session)
+
+        if data.payment_method == "credit":
+            if not data.customer_id:
+                raise HTTPException(status_code=400, detail="customer_id is required for credit checkout")
+            await db.credit_customers.update_one(
+                {"id": data.customer_id, "shop_id": user["shop_id"]},
+                {"$inc": {"current_balance": total_amount}},
+                session=session,
+            )
+
+        if data.payment_method == "credit":
+            payment_status = "on_credit"
+        elif data.payment_method == "mpesa":
+            payment_status = "pending"
+        else:
+            payment_status = "successful"
+        await db.payments.insert_one(
             {
                 "id": str(uuid.uuid4()),
-                "order_id": None,
+                "order_id": order_id,
                 "shop_id": user["shop_id"],
-                "product_id": product["id"],
-                "product_name": product.get("name"),
-                "quantity": quantity,
-                "unit_price": product.get("unit_price", 0),
-                "total": line_total,
+                "amount": total_amount,
+                "method": data.payment_method,
+                "status": payment_status,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            },
+            session=session,
+        )
 
-                "item_id": item.get("id"),
+        # Clear POS cart only after successful order + payment creation
+        await db.cart.update_one(
+            {"id": cart["id"]},
+            {"$set": {"items": [], "updated_at": datetime.now(timezone.utc).isoformat()}},
+            session=session,
+        )
+        return CheckoutResponse(
+            id=order["id"],
+            total_amount=order["total_amount"],
+            shop_id=order["shop_id"],
+            status=order["status"],
+            payment_status=payment_status,
+            payment_method=data.payment_method,
+            customer_id=data.customer_id,
+            items=order_items,
+        )
 
+    if hasattr(client, "start_session"):
+        async with await client.start_session() as session:
+            async with session.start_transaction():
+                return await _run_checkout(session=session)
+    return await _run_checkout()
+
+
+async def create_marketplace_order(data: MarketplaceOrderCreate, owner: dict):
+    existing_cart = await db.cart.find_one({"user_id": owner["id"], "shop_id": owner["shop_id"]}, {"_id": 0})
+    cart_id = existing_cart["id"] if existing_cart else str(uuid.uuid4())
+    cart_items = []
+    original_stock_levels: Dict[str, int] = {}
+    for item in data.items:
+        product = await db.products.find_one({"id": item.product_id, "shop_id": owner["shop_id"]}, {"_id": 0})
+        if not product:
+            raise HTTPException(status_code=404, detail=f"Product {item.product_id} not found")
+        original_stock_levels[item.product_id] = product.get("stock_quantity", 0)
+        if product.get("stock_quantity", 0) < item.quantity:
+            await db.products.update_one(
+                {"id": item.product_id, "shop_id": owner["shop_id"]},
+                {"$inc": {"stock_quantity": item.quantity - product.get("stock_quantity", 0)}},
+            )
+        cart_items.append(
+            {
+                "id": str(uuid.uuid4()),
+                "product_id": item.product_id,
+                "quantity": item.quantity,
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
         )
 
-    order_id = str(uuid.uuid4())
-    for order_item in order_items:
-        order_item["order_id"] = order_id
-        await db.order_items.insert_one(order_item)
+    await db.cart.update_one(
+        {"id": cart_id},
+        {
+            "$set": {
+                "id": cart_id,
+                "user_id": owner["id"],
+                "shop_id": owner["shop_id"],
+                "items": cart_items,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        },
+        upsert=True,
+    )
 
-    order = {
-        "id": order_id,
-        "shop_id": user["shop_id"],
-        "user_id": user["id"],
-        "total_amount": total_amount,
-        "status": "completed",
+    checkout_result = await checkout_cart(
+        CheckoutRequest(payment_method=data.payment_method),
+        {"id": owner["id"], "shop_id": owner["shop_id"], "role": owner.get("role", "owner")},
+    )
+    order_id = checkout_result.id
+    await initialize_order_lifecycle(order_id, owner["shop_id"])
 
-        "customer_id": data.customer_id,
-        "payment_method": data.payment_method,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    await db.orders.insert_one(order)
-
-    if data.payment_method == "credit":
-        if not data.customer_id:
-            raise HTTPException(status_code=400, detail="customer_id is required for credit checkout")
-        await db.credit_customers.update_one(
-            {"id": data.customer_id, "shop_id": user["shop_id"]},
-            {"$inc": {"current_balance": total_amount}},
+    # Restore stock levels so inventory is updated only when delivery is confirmed.
+    for item in data.items:
+        await db.products.update_one(
+            {"id": item.product_id, "shop_id": owner["shop_id"]},
+            {"$set": {"stock_quantity": original_stock_levels.get(item.product_id, 0)}},
         )
 
-    payment_status = "successful" if data.payment_method != "credit" else "on_credit"
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    await db.orders.insert_one(order)
+    if existing_cart:
+        await db.cart.update_one(
+            {"id": existing_cart["id"]},
+            {"$set": {"items": existing_cart.get("items", []), "updated_at": datetime.now(timezone.utc).isoformat()}},
+        )
+    else:
+        await db.cart.delete_one({"id": cart_id})
 
-    await db.payments.insert_one(
+    marketplace_items = [item.model_dump() for item in data.items]
+    total_amount = sum(item.quantity * item.unit_cost for item in data.items)
+    await db.orders.update_one(
+        {"id": order_id, "shop_id": owner["shop_id"]},
         {
-            "id": str(uuid.uuid4()),
-            "order_id": order_id,
-            "shop_id": user["shop_id"],
-            "amount": total_amount,
-            "method": data.payment_method,
-
-            "status": payment_status,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
+            "$set": {
+                "vendor_id": data.vendor_id,
+                "status": "pending",
+                "payment_method": data.payment_method,
+                "items": marketplace_items,
+                "total_amount": total_amount,
+            }
+        },
     )
-    await db.cart.update_one(
-        {"id": cart["id"]},
-        {"$set": {"items": [], "updated_at": datetime.now(timezone.utc).isoformat()}},
+    await db.payments.update_one(
+        {"order_id": order_id, "shop_id": owner["shop_id"]},
+        {"$set": {"amount": total_amount, "status": "pending", "method": data.payment_method}},
     )
-    return CheckoutResponse(
-        id=order["id"],
-        total_amount=order["total_amount"],
-        shop_id=order["shop_id"],
-        status=order["status"],
-        payment_status=payment_status,
-        payment_method=data.payment_method,
-        customer_id=data.customer_id,
-        items=order_items,
-    )
-
-            "status": "successful",
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-    )
-    return CheckoutResponse(**order)
- main
-
-
-async def create_marketplace_order(data: MarketplaceOrderCreate, owner: dict):
-    order_id = str(uuid.uuid4())
-    order = {
-        "id": order_id,
-        "shop_id": owner["shop_id"],
-        "vendor_id": data.vendor_id,
-        "status": "pending",
-        "payment_method": data.payment_method,
-        "items": [item.model_dump() for item in data.items],
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    await db.orders.insert_one(order)
+    order = await db.orders.find_one({"id": order_id, "shop_id": owner["shop_id"]}, {"_id": 0})
     return order
 
 
@@ -2493,24 +3401,41 @@ async def receive_marketplace_order(order_id: str, update: MarketplaceDeliveryUp
                 {"id": item["product_id"], "shop_id": owner["shop_id"]},
                 {"$inc": {"stock_quantity": item["quantity"]}},
             )
-        total_amount = sum(i["quantity"] * i["unit_cost"] for i in order.get("items", []))
-        await db.payments.insert_one(
-            {
-                "id": str(uuid.uuid4()),
-                "order_id": order_id,
-                "shop_id": owner["shop_id"],
-                "amount": total_amount,
-                "method": order.get("payment_method"),
-                "status": "successful",
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            }
-        )
+        existing_payment = await db.payments.find_one({"order_id": order_id, "shop_id": owner["shop_id"]}, {"_id": 0})
+        if existing_payment:
+            await _set_payment_status_if_pending(
+                payment_id=existing_payment["id"],
+                shop_id=owner["shop_id"],
+                new_status="successful",
+                extra_fields={"method": order.get("payment_method")},
+            )
+        else:
+            total_amount = sum(i["quantity"] * i["unit_cost"] for i in order.get("items", []))
+            await db.payments.insert_one(
+                {
+                    "id": str(uuid.uuid4()),
+                    "order_id": order_id,
+                    "shop_id": owner["shop_id"],
+                    "amount": total_amount,
+                    "method": order.get("payment_method"),
+                    "status": "successful",
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
 
-    await db.orders.update_one(
-        {"id": order_id, "shop_id": owner["shop_id"]},
-        {"$set": {"status": update.status, "notes": update.notes}},
-    )
-    order["status"] = update.status
+    if (update.status or "").lower() in VALID_ORDER_STATUSES:
+        updated_order = await set_order_lifecycle_status(order_id, owner["shop_id"], update.status, enforce_transition=False)
+        await db.orders.update_one(
+            {"id": order_id, "shop_id": owner["shop_id"]},
+            {"$set": {"notes": update.notes}},
+        )
+        order = updated_order
+    else:
+        await db.orders.update_one(
+            {"id": order_id, "shop_id": owner["shop_id"]},
+            {"$set": {"status": update.status, "notes": update.notes}},
+        )
+        order["status"] = update.status
     return order
 
 
@@ -2519,6 +3444,63 @@ async def compare_payment_providers(user: dict):
         "recommended_provider": "paystack",
         "guidance": f"Use Paystack for shop_id={user.get('shop_id')}",
     }
+
+
+def to_public_product_view(product: dict) -> PublicProductResponse:
+    return PublicProductResponse(
+        id=product["id"],
+        name=product.get("name", ""),
+        price=product.get("unit_price", 0),
+        image_url=product.get("image_url"),
+        description=product.get("description"),
+        availability="in_stock" if product.get("stock_quantity", 0) > 0 else "out_of_stock",
+    )
+
+
+@api_router.get("/public/stores", response_model=List[PublicStoreResponse])
+async def public_list_stores(limit: Optional[int] = None, offset: int = 0):
+    safe_limit, safe_offset = normalize_limit_offset(limit, offset, default_limit=10000, max_limit=10000)
+    shops = await db.shops.find({}, {"_id": 0}).skip(safe_offset).limit(safe_limit).to_list(safe_limit)
+    active_shops = [shop for shop in shops if shop.get("is_active", True)]
+    return [
+        PublicStoreResponse(
+            id=shop["id"],
+            name=shop.get("name", ""),
+            category=shop.get("category"),
+        )
+        for shop in active_shops
+    ]
+
+
+@api_router.get(
+    "/public/stores/{shop_id}/products",
+    response_model=List[PublicProductResponse],
+)
+async def public_list_store_products(shop_id: str, limit: Optional[int] = None, offset: int = 0):
+    safe_limit, safe_offset = normalize_limit_offset(limit, offset, default_limit=10000, max_limit=10000)
+    shop = await db.shops.find_one({"id": shop_id}, {"_id": 0})
+    if not shop or not shop.get("is_active", True):
+        raise HTTPException(status_code=404, detail="Store not found")
+
+    products = await db.products.find({"shop_id": shop_id}, {"_id": 0}).skip(safe_offset).limit(safe_limit).to_list(safe_limit)
+    active_products = [product for product in products if product.get("is_active", True)]
+    return [to_public_product_view(product) for product in active_products]
+
+
+@api_router.get("/public/products", response_model=List[PublicProductResponse])
+async def public_list_products(limit: Optional[int] = None, offset: int = 0):
+    safe_limit, safe_offset = normalize_limit_offset(limit, offset, default_limit=10000, max_limit=10000)
+    products = await db.products.find({"is_active": True}, {"_id": 0}).skip(safe_offset).limit(safe_limit).to_list(safe_limit)
+    return [to_public_product_view(product) for product in products]
+
+
+@api_router.get("/public/products/{product_id}", response_model=PublicProductResponse)
+async def public_get_product(product_id: str):
+    product = await db.products.find_one({"id": product_id}, {"_id": 0})
+    if not product or not product.get("is_active", True):
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    return to_public_product_view(product)
 
 
 # =============================================================================
@@ -2555,6 +3537,19 @@ app.add_middleware(
 
 # Include router
 app.include_router(api_router)
+
+
+@app.on_event("startup")
+async def ensure_indexes():
+    try:
+        await db.orders.create_index([("user_id", 1), ("created_at", -1)])
+        await db.orders.create_index([("shop_id", 1), ("created_at", -1)])
+        await db.orders.create_index([("lifecycle_status", 1), ("shop_id", 1)])
+        await db.payments.create_index("reference", unique=True, sparse=True)
+        await db.order_items.create_index("order_id")
+        await db.customer_cart.create_index([("user_id", 1), ("shop_id", 1)])
+    except Exception:
+        logger.exception("Failed to ensure indexes")
 
 
 @app.on_event("shutdown")
@@ -2671,6 +3666,16 @@ async def paystack_verify(reference: str, user: dict = Depends(get_current_user)
                 }
             },
         )
+        payment = await db.payments.find_one(
+            {"shop_id": user["shop_id"], "paystack_reference": reference}, {"_id": 0}
+        )
+        if payment:
+            await _set_payment_status_if_pending(
+                payment_id=payment["id"],
+                shop_id=user["shop_id"],
+                new_status="successful",
+                extra_fields={"method": "paystack", "paystack_reference": reference},
+            )
         return {"status": "success", "reference": reference, "sandbox": True}
 
     headers = {"Authorization": f"Bearer {paystack_secret}"}
@@ -2693,13 +3698,37 @@ async def paystack_verify(reference: str, user: dict = Depends(get_current_user)
             {"id": transaction["sale_id"]},
             {"$set": {"status": "completed", "mpesa_transaction_id": receipt}},
         )
+        payment = await db.payments.find_one(
+            {"shop_id": user["shop_id"], "paystack_reference": reference}, {"_id": 0}
+        )
+        if payment:
+            await _set_payment_status_if_pending(
+                payment_id=payment["id"],
+                shop_id=user["shop_id"],
+                new_status="successful",
+                extra_fields={"method": "paystack", "paystack_reference": receipt},
+            )
     return payload
 
 
 @api_router.post("/paystack/webhook")
-async def paystack_webhook(payload: PaystackWebhookPayload):
-    event = payload.event
-    data = payload.data or {}
+async def paystack_webhook(
+    request: Request,
+    x_paystack_signature: Optional[str] = Header(default=None, alias="x-paystack-signature"),
+):
+    logger.warning("Deprecated webhook endpoint used")
+    raw_body = await request.body()
+    secret = os.environ.get("PAYSTACK_WEBHOOK_SECRET")
+    if not verify_paystack_signature(raw_body, x_paystack_signature or "", secret or ""):
+        raise HTTPException(status_code=400, detail="Invalid webhook signature")
+
+    payload = json.loads(raw_body.decode("utf-8"))
+    logger.info("Paystack webhook received path=/paystack/webhook")
+    event_response = await handle_paystack_webhook_event(payload)
+
+    # Keep legacy side-effects for backwards compatibility with sale-based Paystack flows
+    event = payload.get("event")
+    data = payload.get("data", {}) or {}
     reference = data.get("reference")
     if event == "charge.success" and reference:
         transaction = await db.mpesa_transactions.find_one(
@@ -2714,7 +3743,15 @@ async def paystack_webhook(payload: PaystackWebhookPayload):
                 {"id": transaction["sale_id"]},
                 {"$set": {"status": "completed", "mpesa_transaction_id": reference}},
             )
-    return {"received": True}
+    return event_response
+
+
+@app.post("/api/paystack/webhook")
+async def paystack_webhook_alias(
+    request: Request,
+    x_paystack_signature: Optional[str] = Header(default=None, alias="x-paystack-signature"),
+):
+    return await paystack_webhook(request=request, x_paystack_signature=x_paystack_signature)
 
 
 @api_router.post("/client-errors")
