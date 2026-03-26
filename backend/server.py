@@ -2428,9 +2428,6 @@ async def checkout_cart(data: CheckoutRequest, user: dict):
         )
 
     payment_status = "successful" if data.payment_method != "credit" else "on_credit"
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    await db.orders.insert_one(order)
 
     await db.payments.insert_one(
         {
@@ -2458,13 +2455,6 @@ async def checkout_cart(data: CheckoutRequest, user: dict):
         customer_id=data.customer_id,
         items=order_items,
     )
-
-            "status": "successful",
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-    )
-    return CheckoutResponse(**order)
- main
 
 
 async def create_marketplace_order(data: MarketplaceOrderCreate, owner: dict):
