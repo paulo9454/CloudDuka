@@ -192,6 +192,9 @@ class ProductCreate(BaseModel):
     stock_quantity: int = 0
     min_stock_level: int = 5
     unit: str = "piece"
+    image_url: Optional[str] = None
+    description: Optional[str] = None
+    is_active: bool = True
     # Bundle pricing fields
     sell_by: str = "unit"  # "unit" or "bundle"
     bundle_units: Optional[int] = None  # e.g., 3 units per bundle
@@ -208,6 +211,9 @@ class ProductUpdate(BaseModel):
     stock_quantity: Optional[int] = None
     min_stock_level: Optional[int] = None
     unit: Optional[str] = None
+    image_url: Optional[str] = None
+    description: Optional[str] = None
+    is_active: Optional[bool] = None
     sell_by: Optional[str] = None
     bundle_units: Optional[int] = None
     bundle_price: Optional[float] = None
@@ -225,6 +231,9 @@ class ProductResponse(BaseModel):
     stock_quantity: int
     min_stock_level: int
     unit: str
+    image_url: Optional[str] = None
+    description: Optional[str] = None
+    is_active: bool = True
     sell_by: str = "unit"
     bundle_units: Optional[int] = None
     bundle_price: Optional[float] = None
@@ -864,6 +873,9 @@ async def create_product(
         "stock_quantity": data.stock_quantity,
         "min_stock_level": data.min_stock_level,
         "unit": data.unit,
+        "image_url": data.image_url,
+        "description": data.description,
+        "is_active": data.is_active,
         "shop_id": shop_id,
         "created_at": now,
         "updated_at": now,
@@ -2428,9 +2440,6 @@ async def checkout_cart(data: CheckoutRequest, user: dict):
         )
 
     payment_status = "successful" if data.payment_method != "credit" else "on_credit"
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    await db.orders.insert_one(order)
 
     await db.payments.insert_one(
         {
@@ -2458,13 +2467,6 @@ async def checkout_cart(data: CheckoutRequest, user: dict):
         customer_id=data.customer_id,
         items=order_items,
     )
-
-            "status": "successful",
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-    )
-    return CheckoutResponse(**order)
- main
 
 
 async def create_marketplace_order(data: MarketplaceOrderCreate, owner: dict):
