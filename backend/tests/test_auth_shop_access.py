@@ -101,8 +101,10 @@ class FakeCollection:
         self.documents = [doc for doc in self.documents if not self._matches(doc, query)]
         return SimpleNamespace(deleted_count=before - len(self.documents))
 
+
     async def create_index(self, *args, **kwargs):
         return None
+
 
 
 class FakeDB:
@@ -121,7 +123,9 @@ class FakeDB:
             'notifications': [],
             'mpesa_transactions': [],
             'customer_cart': [],
+
             'checkout_requests': [],
+
         }
         defaults.update(collections)
         for name, documents in defaults.items():

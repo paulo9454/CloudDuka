@@ -206,7 +206,9 @@ class FakeDB:
             'damaged_stock': [],
             'purchases': [],
             'customer_cart': [],
+
             'checkout_requests': [],
+
         }
         defaults.update(collections)
         for name, documents in defaults.items():
@@ -500,6 +502,7 @@ class TestCustomerCheckoutBridge:
         assert checkout.status_code == 400
 
 
+
 class TestCustomerOrdersDashboard:
     def _customer_headers(self, client, phone='0766660000'):
         register = client.post('/api/auth/register', json={
@@ -763,6 +766,7 @@ class TestPaymentFlows:
         assert second.status_code == 200
         assert second.json()['updated'] is False
         assert second.json()['status'] == 'successful'
+
 
 
 class TestCreditCustomers:
@@ -1034,6 +1038,7 @@ class TestCartAndOrders:
         assert response.status_code in (401, 403)
 
 
+
 class TestOrderLifecycle:
     def _create_checkout_order(self, client, auth_headers):
         product = client.post('/api/products', json={'name': 'Lifecycle Product', 'unit_price': 100.0, 'stock_quantity': 20}, headers=auth_headers).json()
@@ -1185,6 +1190,7 @@ class TestOrderLifecycle:
         assert lifecycle_indexes
 
 
+
 class TestPublicCatalog:
     def test_public_stores_list(self, client):
         response = client.get('/api/public/stores')
@@ -1194,6 +1200,7 @@ class TestPublicCatalog:
         assert any(store['id'] == TEST_SHOP_ID for store in payload)
         assert all(set(store.keys()) <= {'id', 'name', 'category'} for store in payload)
 
+
     def test_public_stores_pagination(self, client):
         server.db.shops.documents.extend([
             {'id': 'shop-2', 'name': 'Shop 2', 'owner_id': TEST_USER_ID, 'created_at': 'now', 'is_active': True},
@@ -1202,6 +1209,7 @@ class TestPublicCatalog:
         response = client.get('/api/public/stores?limit=1&offset=1')
         assert response.status_code == 200
         assert len(response.json()) == 1
+
 
     def test_public_store_products_filters_inactive_and_hides_internal_fields(self, client, auth_headers):
         active_product = client.post('/api/products', json={
@@ -1265,9 +1273,11 @@ class TestPublicCatalog:
         inactive_response = client.get(f"/api/public/products/{inactive['id']}")
         assert inactive_response.status_code == 404
 
+
     def test_public_products_list_pagination(self, client, auth_headers):
         client.post('/api/products', json={'name': 'Public List A', 'unit_price': 20.0, 'stock_quantity': 5, 'is_active': True}, headers=auth_headers)
         client.post('/api/products', json={'name': 'Public List B', 'unit_price': 25.0, 'stock_quantity': 5, 'is_active': True}, headers=auth_headers)
         response = client.get('/api/public/products?limit=1&offset=0')
         assert response.status_code == 200
         assert len(response.json()) == 1
+

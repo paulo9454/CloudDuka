@@ -529,6 +529,7 @@ class CustomerCheckoutRequest(BaseModel):
     customer_id: Optional[str] = None
 
 
+
 class CustomerOrderItemResponse(BaseModel):
     product_id: str
     name: str
@@ -549,6 +550,7 @@ class CustomerOrderResponse(BaseModel):
     created_at: str
     items: List[CustomerOrderItemResponse]
     payment: CustomerOrderPaymentResponse
+
 
 
 class OrderStatusPatch(BaseModel):
@@ -695,10 +697,12 @@ def require_customer(user: dict = Depends(get_current_user)):
     return user
 
 
+
 def require_shopkeeper(user: dict = Depends(get_current_user)):
     if user.get("role") != "shopkeeper":
         raise HTTPException(status_code=403, detail="Shopkeeper access required")
     return user
+
 
 
 def require_active_subscription(user: dict = Depends(get_current_user)):
@@ -2586,6 +2590,7 @@ def build_customer_cart_item_response(item: dict, product: dict) -> CustomerCart
     )
 
 
+
 def build_customer_order_response(order: dict, order_items: List[dict], payment: Optional[dict]) -> CustomerOrderResponse:
     items: List[CustomerOrderItemResponse] = []
     for item in order_items:
@@ -2612,6 +2617,7 @@ def build_customer_order_response(order: dict, order_items: List[dict], payment:
         items=items,
         payment=payment_payload,
     )
+
 
 
 @api_router.post("/customer/cart", response_model=CustomerCartItemResponse)
@@ -2716,6 +2722,7 @@ async def customer_delete_cart_item(item_id: str, customer: dict = Depends(requi
 @api_router.post("/customer/checkout")
 async def customer_checkout(
     data: CustomerCheckoutRequest,
+
     request: Request,
     customer: dict = Depends(require_customer),
 ):
@@ -2725,6 +2732,10 @@ async def customer_checkout(
         return existing_response
 
     logger.info("Checkout start flow=customer user_id=%s", customer["id"])
+
+    customer: dict = Depends(require_customer),
+):
+
     customer_items = await db.customer_cart.find({"user_id": customer["id"]}, {"_id": 0}).to_list(1000)
     if not customer_items:
         raise HTTPException(status_code=400, detail="Customer cart is empty")
@@ -2776,6 +2787,7 @@ async def customer_checkout(
     )
 
     checkout_user = {**customer, "shop_id": checkout_shop_id}
+
     try:
         checkout_result = await checkout_cart(
             CheckoutRequest(
@@ -2788,10 +2800,20 @@ async def customer_checkout(
         logger.exception("Checkout failure flow=customer user_id=%s", customer["id"])
         raise
 
+    checkout_result = await checkout_cart(
+        CheckoutRequest(
+            payment_method=data.payment_method,
+            customer_id=data.customer_id,
+        ),
+        checkout_user,
+    )
+
+
     await db.orders.update_one(
         {"id": checkout_result.id, "shop_id": checkout_shop_id},
         {"$set": {"source": "customer_app"}},
     )
+
     await initialize_order_lifecycle(checkout_result.id, checkout_shop_id)
     await db.customer_cart.delete_many({"user_id": customer["id"]})
     response_payload = {"order": checkout_result.model_dump(), "items": checkout_result.items}
@@ -2851,6 +2873,11 @@ async def customer_get_order(order_id: str, customer: dict = Depends(require_cus
     order_items = await db.order_items.find({"order_id": order["id"]}, {"_id": 0}).to_list(1000)
     payment = await db.payments.find_one({"order_id": order["id"]}, {"_id": 0})
     return build_customer_order_response(order, order_items, payment)
+
+    await db.customer_cart.delete_many({"user_id": customer["id"]})
+
+    return {"order": checkout_result.model_dump(), "items": checkout_result.items}
+
 
 
 
@@ -3210,6 +3237,7 @@ async def checkout_cart(data: CheckoutRequest, user: dict):
             if not product:
                 raise HTTPException(status_code=404, detail="Product not found")
 
+
             stock_update = await db.products.update_one(
                 {
                     "id": product["id"],
@@ -3271,6 +3299,65 @@ async def checkout_cart(data: CheckoutRequest, user: dict):
             payment_status = "pending"
         else:
             payment_status = "successful"
+
+
+            stock_update = await db.products.update_one(
+                {
+                    "id": product["id"],
+                    "shop_id": user["shop_id"],
+                    "stock_quantity": {"$gte": quantity},
+                },
+                {"$inc": {"stock_quantity": -quantity}},
+                session=session,
+            )
+            if stock_update.matched_count == 0:
+                raise HTTPException(status_code=400, detail="Insufficient stock")
+
+            line_total = product.get("unit_price", 0) * quantity
+            total_amount += line_total
+            order_items.append(
+                {
+                    "id": str(uuid.uuid4()),
+                    "order_id": None,
+                    "shop_id": user["shop_id"],
+                    "product_id": product["id"],
+                    "product_name": product.get("name"),
+                    "quantity": quantity,
+                    "unit_price": product.get("unit_price", 0),
+                    "total": line_total,
+                    "item_id": item.get("id"),
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+
+        order_id = str(uuid.uuid4())
+        for order_item in order_items:
+            order_item["order_id"] = order_id
+            await db.order_items.insert_one(order_item, session=session)
+
+        order = {
+            "id": order_id,
+            "shop_id": user["shop_id"],
+            "user_id": user["id"],
+            "total_amount": total_amount,
+            "status": "completed",
+            "customer_id": data.customer_id,
+            "payment_method": data.payment_method,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        await db.orders.insert_one(order, session=session)
+
+        if data.payment_method == "credit":
+            if not data.customer_id:
+                raise HTTPException(status_code=400, detail="customer_id is required for credit checkout")
+            await db.credit_customers.update_one(
+                {"id": data.customer_id, "shop_id": user["shop_id"]},
+                {"$inc": {"current_balance": total_amount}},
+                session=session,
+            )
+
+        payment_status = "successful" if data.payment_method != "credit" else "on_credit"
+
         await db.payments.insert_one(
             {
                 "id": str(uuid.uuid4()),
@@ -3300,6 +3387,7 @@ async def checkout_cart(data: CheckoutRequest, user: dict):
             customer_id=data.customer_id,
             items=order_items,
         )
+
 
     if hasattr(client, "start_session"):
         async with await client.start_session() as session:
@@ -3332,6 +3420,29 @@ async def create_marketplace_order(data: MarketplaceOrderCreate, owner: dict):
             }
         )
 
+
+
+    if hasattr(client, "start_session"):
+        async with await client.start_session() as session:
+            async with session.start_transaction():
+                return await _run_checkout(session=session)
+    return await _run_checkout()
+
+    payment_status = "successful" if data.payment_method != "credit" else "on_credit"
+
+    await db.payments.insert_one(
+        {
+            "id": str(uuid.uuid4()),
+            "order_id": order_id,
+            "shop_id": user["shop_id"],
+            "amount": total_amount,
+            "method": data.payment_method,
+
+            "status": payment_status,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+
     await db.cart.update_one(
         {"id": cart_id},
         {
@@ -3346,12 +3457,14 @@ async def create_marketplace_order(data: MarketplaceOrderCreate, owner: dict):
         upsert=True,
     )
 
+
     checkout_result = await checkout_cart(
         CheckoutRequest(payment_method=data.payment_method),
         {"id": owner["id"], "shop_id": owner["shop_id"], "role": owner.get("role", "owner")},
     )
     order_id = checkout_result.id
     await initialize_order_lifecycle(order_id, owner["shop_id"])
+
 
     # Restore stock levels so inventory is updated only when delivery is confirmed.
     for item in data.items:
@@ -3458,9 +3571,14 @@ def to_public_product_view(product: dict) -> PublicProductResponse:
 
 
 @api_router.get("/public/stores", response_model=List[PublicStoreResponse])
+
 async def public_list_stores(limit: Optional[int] = None, offset: int = 0):
     safe_limit, safe_offset = normalize_limit_offset(limit, offset, default_limit=10000, max_limit=10000)
     shops = await db.shops.find({}, {"_id": 0}).skip(safe_offset).limit(safe_limit).to_list(safe_limit)
+
+async def public_list_stores():
+    shops = await db.shops.find({}, {"_id": 0}).to_list(10000)
+
     active_shops = [shop for shop in shops if shop.get("is_active", True)]
     return [
         PublicStoreResponse(
@@ -3476,15 +3594,24 @@ async def public_list_stores(limit: Optional[int] = None, offset: int = 0):
     "/public/stores/{shop_id}/products",
     response_model=List[PublicProductResponse],
 )
+
 async def public_list_store_products(shop_id: str, limit: Optional[int] = None, offset: int = 0):
     safe_limit, safe_offset = normalize_limit_offset(limit, offset, default_limit=10000, max_limit=10000)
+
+async def public_list_store_products(shop_id: str):
+
     shop = await db.shops.find_one({"id": shop_id}, {"_id": 0})
     if not shop or not shop.get("is_active", True):
         raise HTTPException(status_code=404, detail="Store not found")
 
+
     products = await db.products.find({"shop_id": shop_id}, {"_id": 0}).skip(safe_offset).limit(safe_limit).to_list(safe_limit)
+
+    products = await db.products.find({"shop_id": shop_id}, {"_id": 0}).to_list(10000)
+
     active_products = [product for product in products if product.get("is_active", True)]
     return [to_public_product_view(product) for product in active_products]
+
 
 
 @api_router.get("/public/products", response_model=List[PublicProductResponse])
@@ -3492,6 +3619,7 @@ async def public_list_products(limit: Optional[int] = None, offset: int = 0):
     safe_limit, safe_offset = normalize_limit_offset(limit, offset, default_limit=10000, max_limit=10000)
     products = await db.products.find({"is_active": True}, {"_id": 0}).skip(safe_offset).limit(safe_limit).to_list(safe_limit)
     return [to_public_product_view(product) for product in products]
+
 
 
 @api_router.get("/public/products/{product_id}", response_model=PublicProductResponse)
