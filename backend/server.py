@@ -2752,11 +2752,42 @@ async def checkout_cart(data: CheckoutRequest, user: dict):
             items=order_items,
         )
 
+
     if hasattr(client, "start_session"):
         async with await client.start_session() as session:
             async with session.start_transaction():
                 return await _run_checkout(session=session)
     return await _run_checkout()
+
+    payment_status = "successful" if data.payment_method != "credit" else "on_credit"
+
+    await db.payments.insert_one(
+        {
+            "id": str(uuid.uuid4()),
+            "order_id": order_id,
+            "shop_id": user["shop_id"],
+            "amount": total_amount,
+            "method": data.payment_method,
+
+            "status": payment_status,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    await db.cart.update_one(
+        {"id": cart["id"]},
+        {"$set": {"items": [], "updated_at": datetime.now(timezone.utc).isoformat()}},
+    )
+    return CheckoutResponse(
+        id=order["id"],
+        total_amount=order["total_amount"],
+        shop_id=order["shop_id"],
+        status=order["status"],
+        payment_status=payment_status,
+        payment_method=data.payment_method,
+        customer_id=data.customer_id,
+        items=order_items,
+    )
+
 
 
 async def create_marketplace_order(data: MarketplaceOrderCreate, owner: dict):
