@@ -146,6 +146,11 @@ class FakeCollection:
         self.documents = [document for document in self.documents if not self._matches(document, query)]
         return FakeDeleteResult(deleted_count=before - len(self.documents))
 
+    async def delete_many(self, query):
+        before = len(self.documents)
+        self.documents = [document for document in self.documents if not self._matches(document, query)]
+        return FakeDeleteResult(deleted_count=before - len(self.documents))
+
     async def count_documents(self, query):
         return len([document for document in self.documents if self._matches(document, query)])
 
@@ -176,6 +181,7 @@ class FakeDB:
             'mpesa_transactions': [],
             'damaged_stock': [],
             'purchases': [],
+            'customer_cart': [],
         }
         defaults.update(collections)
         for name, documents in defaults.items():
@@ -233,6 +239,7 @@ class TestAuthLogin:
         data = response.json()
         assert 'token' in data
         assert data['user']['phone'] == TEST_PHONE
+        assert 'pin_hash' not in data['user']
 
     def test_login_invalid_credentials(self, client):
         response = client.post('/api/auth/login', json={'phone': '0000000000', 'pin': '9999'})
@@ -241,6 +248,231 @@ class TestAuthLogin:
     def test_login_missing_fields(self, client):
         response = client.post('/api/auth/login', json={'phone': TEST_PHONE})
         assert response.status_code == 422
+
+
+class TestCustomerAuth:
+    def test_customer_registration_defaults_to_customer_role(self, client):
+        response = client.post('/api/auth/register', json={
+            'phone': '0799990000',
+            'pin': '1234',
+            'name': 'Customer One',
+        })
+        assert response.status_code == 200, response.text
+        payload = response.json()
+        assert payload['user']['role'] == 'customer'
+        assert payload['user'].get('shop_id') is None
+
+    def test_customer_login_and_sanitized_user(self, client):
+        register = client.post('/api/auth/register', json={
+            'phone': '0799990001',
+            'pin': '1234',
+            'name': 'Customer Two',
+            'role': 'customer',
+        })
+        assert register.status_code == 200, register.text
+
+        login = client.post('/api/auth/login', json={'phone': '0799990001', 'pin': '1234'})
+        assert login.status_code == 200, login.text
+        user = login.json()['user']
+        assert user['role'] == 'customer'
+        assert 'pin_hash' not in user
+
+    def test_customer_cannot_access_owner_shop_routes(self, client):
+        register = client.post('/api/auth/register', json={
+            'phone': '0799990002',
+            'pin': '1234',
+            'name': 'Customer Three',
+        })
+        token = register.json()['token']
+        headers = {'Authorization': f'Bearer {token}'}
+
+        blocked = client.get('/api/products', headers=headers)
+        assert blocked.status_code == 403
+
+
+class TestCustomerCart:
+    def _customer_headers(self, client, phone='0788880000'):
+        register = client.post('/api/auth/register', json={
+            'phone': phone,
+            'pin': '1234',
+            'name': f'Customer {phone[-2:]}',
+        })
+        assert register.status_code == 200, register.text
+        token = register.json()['token']
+        return {'Authorization': f'Bearer {token}'}
+
+    def test_customer_add_to_cart_valid_product(self, client, auth_headers):
+        product = client.post('/api/products', json={
+            'name': 'Catalog Product',
+            'unit_price': 150.0,
+            'stock_quantity': 20,
+            'is_active': True,
+        }, headers=auth_headers).json()
+        customer_headers = self._customer_headers(client, phone='0788880001')
+
+        response = client.post('/api/customer/cart', json={
+            'product_id': product['id'],
+            'shop_id': TEST_SHOP_ID,
+            'quantity': 2,
+        }, headers=customer_headers)
+        assert response.status_code == 200, response.text
+        item = response.json()
+        assert item['product_id'] == product['id']
+        assert item['name'] == 'Catalog Product'
+        assert item['price'] == 150.0
+        assert item['quantity'] == 2
+
+    def test_customer_cart_rejects_inactive_product(self, client, auth_headers):
+        product = client.post('/api/products', json={
+            'name': 'Inactive Catalog Product',
+            'unit_price': 99.0,
+            'stock_quantity': 5,
+            'is_active': False,
+        }, headers=auth_headers).json()
+        customer_headers = self._customer_headers(client, phone='0788880002')
+
+        response = client.post('/api/customer/cart', json={
+            'product_id': product['id'],
+            'shop_id': TEST_SHOP_ID,
+            'quantity': 1,
+        }, headers=customer_headers)
+        assert response.status_code == 400
+
+    def test_customer_cart_rejects_invalid_quantity(self, client, auth_headers):
+        product = client.post('/api/products', json={
+            'name': 'Qty Validation Product',
+            'unit_price': 75.0,
+            'stock_quantity': 10,
+            'is_active': True,
+        }, headers=auth_headers).json()
+        customer_headers = self._customer_headers(client, phone='0788880003')
+
+        response = client.post('/api/customer/cart', json={
+            'product_id': product['id'],
+            'shop_id': TEST_SHOP_ID,
+            'quantity': 0,
+        }, headers=customer_headers)
+        assert response.status_code == 422
+
+    def test_customer_cart_customer_only_access(self, client, auth_headers):
+        product = client.post('/api/products', json={
+            'name': 'Customer Only Product',
+            'unit_price': 120.0,
+            'stock_quantity': 10,
+            'is_active': True,
+        }, headers=auth_headers).json()
+
+        response = client.post('/api/customer/cart', json={
+            'product_id': product['id'],
+            'shop_id': TEST_SHOP_ID,
+            'quantity': 1,
+        }, headers=auth_headers)
+        assert response.status_code == 403
+
+    def test_customer_cart_retrieval_and_update(self, client, auth_headers):
+        product = client.post('/api/products', json={
+            'name': 'Retrieval Product',
+            'unit_price': 200.0,
+            'stock_quantity': 30,
+            'is_active': True,
+        }, headers=auth_headers).json()
+        customer_headers = self._customer_headers(client, phone='0788880004')
+
+        added = client.post('/api/customer/cart', json={
+            'product_id': product['id'],
+            'shop_id': TEST_SHOP_ID,
+            'quantity': 1,
+        }, headers=customer_headers)
+        assert added.status_code == 200
+        item_id = added.json()['id']
+
+        cart = client.get('/api/customer/cart', headers=customer_headers)
+        assert cart.status_code == 200
+        assert len(cart.json()) == 1
+        assert cart.json()[0]['quantity'] == 1
+
+        updated = client.put(f'/api/customer/cart/{item_id}', json={'quantity': 4}, headers=customer_headers)
+        assert updated.status_code == 200
+        assert updated.json()['quantity'] == 4
+
+        deleted = client.delete(f'/api/customer/cart/{item_id}', headers=customer_headers)
+        assert deleted.status_code == 200
+
+        empty = client.get('/api/customer/cart', headers=customer_headers)
+        assert empty.status_code == 200
+        assert empty.json() == []
+
+
+class TestCustomerCheckoutBridge:
+    def _customer_headers(self, client, phone='0777770000'):
+        register = client.post('/api/auth/register', json={
+            'phone': phone,
+            'pin': '1234',
+            'name': f'Checkout Customer {phone[-2:]}',
+        })
+        assert register.status_code == 200, register.text
+        return {'Authorization': f"Bearer {register.json()['token']}"}
+
+    def test_customer_checkout_success_and_cart_cleared(self, client, auth_headers):
+        product = client.post('/api/products', json={
+            'name': 'Checkout Product',
+            'unit_price': 100.0,
+            'stock_quantity': 5,
+            'is_active': True,
+        }, headers=auth_headers).json()
+        customer_headers = self._customer_headers(client, phone='0777770001')
+
+        add = client.post('/api/customer/cart', json={
+            'product_id': product['id'],
+            'shop_id': TEST_SHOP_ID,
+            'quantity': 2,
+        }, headers=customer_headers)
+        assert add.status_code == 200, add.text
+
+        checkout = client.post('/api/customer/checkout', json={'payment_method': 'cash'}, headers=customer_headers)
+        assert checkout.status_code == 200, checkout.text
+        payload = checkout.json()
+        assert payload['order']['total_amount'] == 200.0
+
+        assert server.db.customer_cart.documents == []
+        created_order = next(order for order in server.db.orders.documents if order['id'] == payload['order']['id'])
+        assert created_order.get('source') == 'customer_app'
+
+    def test_customer_checkout_rejects_empty_cart(self, client):
+        customer_headers = self._customer_headers(client, phone='0777770002')
+        response = client.post('/api/customer/checkout', json={'payment_method': 'cash'}, headers=customer_headers)
+        assert response.status_code == 400
+
+    def test_customer_checkout_rejects_multi_shop_cart(self, client):
+        customer_headers = self._customer_headers(client, phone='0777770003')
+        customer = next(user for user in server.db.users.documents if user['phone'] == '0777770003')
+        server.db.shops.documents.append({'id': 'shop-2', 'name': 'Second Shop', 'owner_id': TEST_USER_ID, 'created_at': 'now'})
+        server.db.customer_cart.documents.extend([
+            {'id': 'c1', 'user_id': customer['id'], 'product_id': 'p1', 'shop_id': TEST_SHOP_ID, 'quantity': 1, 'created_at': 'now'},
+            {'id': 'c2', 'user_id': customer['id'], 'product_id': 'p2', 'shop_id': 'shop-2', 'quantity': 1, 'created_at': 'now'},
+        ])
+        response = client.post('/api/customer/checkout', json={'payment_method': 'cash'}, headers=customer_headers)
+        assert response.status_code == 400
+
+    def test_customer_checkout_rejects_insufficient_stock(self, client, auth_headers):
+        product = client.post('/api/products', json={
+            'name': 'Low Stock Checkout Product',
+            'unit_price': 100.0,
+            'stock_quantity': 1,
+            'is_active': True,
+        }, headers=auth_headers).json()
+        customer_headers = self._customer_headers(client, phone='0777770004')
+
+        add = client.post('/api/customer/cart', json={
+            'product_id': product['id'],
+            'shop_id': TEST_SHOP_ID,
+            'quantity': 2,
+        }, headers=customer_headers)
+        # Add succeeds because customer cart does not reserve stock; failure is enforced at checkout
+        assert add.status_code == 200, add.text
+
+        checkout = client.post('/api/customer/checkout', json={'payment_method': 'cash'}, headers=customer_headers)
+        assert checkout.status_code == 400
 
 
 class TestCreditCustomers:
@@ -487,3 +719,75 @@ class TestCartAndOrders:
     def test_orders_requires_auth(self, client):
         response = client.get('/api/orders')
         assert response.status_code in (401, 403)
+
+
+class TestPublicCatalog:
+    def test_public_stores_list(self, client):
+        response = client.get('/api/public/stores')
+        assert response.status_code == 200, response.text
+        payload = response.json()
+        assert isinstance(payload, list)
+        assert any(store['id'] == TEST_SHOP_ID for store in payload)
+        assert all(set(store.keys()) <= {'id', 'name', 'category'} for store in payload)
+
+    def test_public_store_products_filters_inactive_and_hides_internal_fields(self, client, auth_headers):
+        active_product = client.post('/api/products', json={
+            'name': 'Public Active',
+            'unit_price': 120.0,
+            'cost_price': 80.0,
+            'stock_quantity': 3,
+            'is_active': True,
+            'image_url': 'https://example.com/a.jpg',
+            'description': 'Visible product',
+        }, headers=auth_headers).json()
+        client.post('/api/products', json={
+            'name': 'Public Inactive',
+            'unit_price': 120.0,
+            'cost_price': 80.0,
+            'stock_quantity': 0,
+            'is_active': False,
+            'description': 'Hidden product',
+        }, headers=auth_headers).json()
+
+        response = client.get(f'/api/public/stores/{TEST_SHOP_ID}/products')
+        assert response.status_code == 200, response.text
+        products = response.json()
+
+        assert any(product['id'] == active_product['id'] for product in products)
+        assert all(product['name'] != 'Public Inactive' for product in products)
+        assert all('cost_price' not in product for product in products)
+        assert all(
+            set(product.keys()) == {'id', 'name', 'price', 'image_url', 'description', 'availability'}
+            for product in products
+        )
+
+    def test_public_single_product_view(self, client, auth_headers):
+        in_stock = client.post('/api/products', json={
+            'name': 'Single Product',
+            'unit_price': 99.0,
+            'stock_quantity': 1,
+            'is_active': True,
+        }, headers=auth_headers).json()
+        out_of_stock = client.post('/api/products', json={
+            'name': 'Out of Stock Product',
+            'unit_price': 49.0,
+            'stock_quantity': 0,
+            'is_active': True,
+        }, headers=auth_headers).json()
+        inactive = client.post('/api/products', json={
+            'name': 'Inactive Product',
+            'unit_price': 49.0,
+            'stock_quantity': 5,
+            'is_active': False,
+        }, headers=auth_headers).json()
+
+        in_stock_response = client.get(f"/api/public/products/{in_stock['id']}")
+        assert in_stock_response.status_code == 200
+        assert in_stock_response.json()['availability'] == 'in_stock'
+
+        out_stock_response = client.get(f"/api/public/products/{out_of_stock['id']}")
+        assert out_stock_response.status_code == 200
+        assert out_stock_response.json()['availability'] == 'out_of_stock'
+
+        inactive_response = client.get(f"/api/public/products/{inactive['id']}")
+        assert inactive_response.status_code == 404

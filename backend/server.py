@@ -18,7 +18,7 @@ import os
 import logging
 from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Literal
 import uuid
 from datetime import datetime, timezone, timedelta
 import jwt
@@ -162,8 +162,9 @@ class UserCreate(BaseModel):
     phone: str
     pin: str
     name: str
-    role: str = "shopkeeper"  # owner or shopkeeper
+    role: Literal["owner", "shopkeeper", "customer"] = "customer"
     shop_name: Optional[str] = None
+    shop_id: Optional[str] = None
 
 
 class UserLogin(BaseModel):
@@ -177,7 +178,7 @@ class UserResponse(BaseModel):
     phone: str
     name: str
     role: str
-    shop_id: str
+    shop_id: Optional[str] = None
     trial_ends_at: Optional[str] = None
     subscription_status: str = "trial"
     created_at: str
@@ -442,6 +443,21 @@ class CheckoutResponse(BaseModel):
     items: List[dict] = []
 
 
+class PublicStoreResponse(BaseModel):
+    id: str
+    name: str
+    category: Optional[str] = None
+
+
+class PublicProductResponse(BaseModel):
+    id: str
+    name: str
+    price: float
+    image_url: Optional[str] = None
+    description: Optional[str] = None
+    availability: str
+
+
 class MarketplaceOrderItem(BaseModel):
     product_id: str
     product_name: str
@@ -468,6 +484,32 @@ class CartItemCreate(BaseModel):
 
 class CartItemUpdate(BaseModel):
     quantity: int = Field(gt=0)
+
+
+class CustomerCartItemCreate(BaseModel):
+    product_id: str
+    shop_id: str
+    quantity: int = Field(gt=0)
+
+
+class CustomerCartItemUpdate(BaseModel):
+    quantity: int = Field(gt=0)
+
+
+class CustomerCartItemResponse(BaseModel):
+    id: str
+    shop_id: str
+    product_id: str
+    name: str
+    price: float
+    image_url: Optional[str] = None
+    quantity: int
+    created_at: str
+
+
+class CustomerCheckoutRequest(BaseModel):
+    payment_method: str
+    customer_id: Optional[str] = None
 
 
 class OrderStatusPatch(BaseModel):
@@ -543,8 +585,25 @@ async def get_current_user(
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
 
-        role = user.get("role") or payload.get("role", "shopkeeper")
+        role = user.get("role") or payload.get("role", "owner")
         default_shop_id = user.get("shop_id") or user.get("default_shop_id") or payload.get("shop_id")
+
+        if role == "customer":
+            hydrated_user = {
+                **user,
+                "role": "customer",
+                "shop_id": None,
+                "default_shop_id": None,
+            }
+            if request and request.url.path.startswith("/api/"):
+                if not (
+                    request.url.path.startswith("/api/auth/")
+                    or request.url.path.startswith("/api/public/")
+                    or request.url.path.startswith("/api/customer/")
+                ):
+                    raise HTTPException(status_code=403, detail="Customer access is limited to public/customer endpoints")
+            return hydrated_user
+
         active_shop_id = x_shop_id or payload.get("shop_id") or default_shop_id
 
         if hasattr(db, "shop_users") and active_shop_id:
@@ -566,7 +625,12 @@ async def get_current_user(
             "default_shop_id": user.get("default_shop_id", default_shop_id),
         }
 
-        if request and request.url.path.startswith("/api/") and not request.url.path.startswith("/api/auth/"):
+        if (
+            role == "owner"
+            and request
+            and request.url.path.startswith("/api/")
+            and not request.url.path.startswith("/api/auth/")
+        ):
             await check_subscription(hydrated_user.get("shop_id"))
 
         return hydrated_user
@@ -579,6 +643,12 @@ async def get_current_user(
 def require_owner(user: dict = Depends(get_current_user)):
     if user["role"] != "owner":
         raise HTTPException(status_code=403, detail="Owner access required")
+    return user
+
+
+def require_customer(user: dict = Depends(get_current_user)):
+    if user.get("role") != "customer":
+        raise HTTPException(status_code=403, detail="Customer access required")
     return user
 
 
@@ -750,6 +820,17 @@ async def register(data: UserCreate):
             "created_at": now.isoformat(),
         }
 
+    # CUSTOMER (default)
+    elif data.role == "customer":
+        user = {
+            "id": user_id,
+            "phone": data.phone,
+            "pin_hash": hash_pin(data.pin),
+            "name": data.name,
+            "role": "customer",
+            "created_at": now.isoformat(),
+        }
+
     else:
         raise HTTPException(status_code=400, detail="Invalid role")
 
@@ -811,12 +892,21 @@ async def login(data: UserLogin):
         membership = await db.shop_users.find_one(
             {"user_id": user["id"], "shop_id": default_shop_id}, {"_id": 0}
         )
-    role = user.get("role") or (membership.get("role") if membership else "shopkeeper")
+    role = user.get("role") or (membership.get("role") if membership else "owner")
     token = create_token(user["id"], default_shop_id, role)
 
     return {
         "token": token,
-        "user": {**user, "role": role, "shop_id": default_shop_id}
+        "user": {
+            "id": user["id"],
+            "phone": user["phone"],
+            "name": user["name"],
+            "role": role,
+            "shop_id": default_shop_id,
+            "trial_ends_at": user.get("trial_ends_at"),
+            "subscription_status": user.get("subscription_status", "trial"),
+            "created_at": user["created_at"],
+        },
     }
 
 
@@ -1079,26 +1169,27 @@ async def create_sale(
     if data.payment_method == "credit" and not data.customer_id:
         raise HTTPException(400, "Customer required for credit sales")
 
-    # Check stock
+    # Atomic stock update with oversell protection
     for item in data.items:
-        product = await db.products.find_one(
-            {"id": item.product_id, "shop_id": shop_id}
-        )
-        if not product:
-            raise HTTPException(404, f"Product {item.product_id} not found")
-
-        if product["stock_quantity"] < item.quantity:
-            raise HTTPException(
-                400,
-                f"Insufficient stock for {product['name']}. Available: {product['stock_quantity']}",
-            )
-
-    # Update stock
-    for item in data.items:
-        await db.products.update_one(
-            {"id": item.product_id, "shop_id": shop_id},
+        stock_update = await db.products.update_one(
+            {
+                "id": item.product_id,
+                "shop_id": shop_id,
+                "stock_quantity": {"$gte": item.quantity},
+            },
             {"$inc": {"stock_quantity": -item.quantity}},
         )
+        if stock_update.matched_count == 0:
+            product = await db.products.find_one(
+                {"id": item.product_id, "shop_id": shop_id},
+                {"_id": 0},
+            )
+            if not product:
+                raise HTTPException(404, f"Product {item.product_id} not found")
+            raise HTTPException(
+                400,
+                f"Insufficient stock for {product.get('name', item.product_id)}. Available: {product.get('stock_quantity', 0)}",
+            )
 
     # Credit balance
     if data.payment_method == "credit" and data.customer_id:
@@ -1293,9 +1384,16 @@ async def create_damaged_stock(
         raise HTTPException(status_code=400, detail="Insufficient stock")
 
     # Reduce stock
-    await db.products.update_one(
-        {"id": data.product_id}, {"$inc": {"stock_quantity": -data.quantity}}
+    stock_update = await db.products.update_one(
+        {
+            "id": data.product_id,
+            "shop_id": user["shop_id"],
+            "stock_quantity": {"$gte": data.quantity},
+        },
+        {"$inc": {"stock_quantity": -data.quantity}},
     )
+    if stock_update.matched_count == 0:
+        raise HTTPException(status_code=400, detail="Insufficient stock")
 
     # Record damaged stock
     damaged_id = str(uuid.uuid4())
@@ -1959,7 +2057,7 @@ async def create_purchase(data: PurchaseCreate, user: dict = Depends(get_current
         # Update product stock and cost price
         cost_per_unit = item.cost / total_units if total_units > 0 else 0
         await db.products.update_one(
-            {"id": item.product_id},
+            {"id": item.product_id, "shop_id": user["shop_id"]},
             {
                 "$inc": {"stock_quantity": total_units},
                 "$set": {"cost_price": cost_per_unit, "updated_at": now},
@@ -2103,6 +2201,191 @@ async def update_shop(data: dict, owner: dict = Depends(require_owner)):
     )
     shop = await db.shops.find_one({"id": owner["shop_id"]}, {"_id": 0})
     return shop
+
+
+def build_customer_cart_item_response(item: dict, product: dict) -> CustomerCartItemResponse:
+    return CustomerCartItemResponse(
+        id=item["id"],
+        shop_id=item["shop_id"],
+        product_id=item["product_id"],
+        name=product.get("name", ""),
+        price=product.get("unit_price", 0),
+        image_url=product.get("image_url"),
+        quantity=item.get("quantity", 0),
+        created_at=item.get("created_at", datetime.now(timezone.utc).isoformat()),
+    )
+
+
+@api_router.post("/customer/cart", response_model=CustomerCartItemResponse)
+async def customer_add_to_cart(
+    data: CustomerCartItemCreate,
+    customer: dict = Depends(require_customer),
+):
+    shop = await db.shops.find_one({"id": data.shop_id}, {"_id": 0})
+    if not shop:
+        raise HTTPException(status_code=404, detail="Shop not found")
+
+    product = await db.products.find_one(
+        {"id": data.product_id, "shop_id": data.shop_id},
+        {"_id": 0},
+    )
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+    if not product.get("is_active", True):
+        raise HTTPException(status_code=400, detail="Product is not active")
+
+    existing = await db.customer_cart.find_one(
+        {
+            "user_id": customer["id"],
+            "product_id": data.product_id,
+            "shop_id": data.shop_id,
+        },
+        {"_id": 0},
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    if existing:
+        new_quantity = existing.get("quantity", 0) + data.quantity
+        await db.customer_cart.update_one(
+            {"id": existing["id"], "user_id": customer["id"]},
+            {"$set": {"quantity": new_quantity, "updated_at": now}},
+        )
+        existing["quantity"] = new_quantity
+        existing["updated_at"] = now
+        return build_customer_cart_item_response(existing, product)
+
+    cart_item = {
+        "id": str(uuid.uuid4()),
+        "user_id": customer["id"],
+        "product_id": data.product_id,
+        "shop_id": data.shop_id,
+        "quantity": data.quantity,
+        "created_at": now,
+    }
+    await db.customer_cart.insert_one(cart_item)
+    return build_customer_cart_item_response(cart_item, product)
+
+
+@api_router.get("/customer/cart", response_model=List[CustomerCartItemResponse])
+async def customer_get_cart(customer: dict = Depends(require_customer)):
+    items = await db.customer_cart.find({"user_id": customer["id"]}, {"_id": 0}).to_list(1000)
+    response_items: List[CustomerCartItemResponse] = []
+    for item in items:
+        product = await db.products.find_one(
+            {"id": item["product_id"], "shop_id": item["shop_id"]},
+            {"_id": 0},
+        )
+        if not product or not product.get("is_active", True):
+            continue
+        response_items.append(build_customer_cart_item_response(item, product))
+    return response_items
+
+
+@api_router.put("/customer/cart/{item_id}", response_model=CustomerCartItemResponse)
+async def customer_update_cart_item(
+    item_id: str,
+    data: CustomerCartItemUpdate,
+    customer: dict = Depends(require_customer),
+):
+    item = await db.customer_cart.find_one({"id": item_id, "user_id": customer["id"]}, {"_id": 0})
+    if not item:
+        raise HTTPException(status_code=404, detail="Cart item not found")
+
+    product = await db.products.find_one(
+        {"id": item["product_id"], "shop_id": item["shop_id"]},
+        {"_id": 0},
+    )
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+    if not product.get("is_active", True):
+        raise HTTPException(status_code=400, detail="Product is not active")
+
+    await db.customer_cart.update_one(
+        {"id": item_id, "user_id": customer["id"]},
+        {"$set": {"quantity": data.quantity, "updated_at": datetime.now(timezone.utc).isoformat()}},
+    )
+    item["quantity"] = data.quantity
+    return build_customer_cart_item_response(item, product)
+
+
+@api_router.delete("/customer/cart/{item_id}")
+async def customer_delete_cart_item(item_id: str, customer: dict = Depends(require_customer)):
+    result = await db.customer_cart.delete_one({"id": item_id, "user_id": customer["id"]})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Cart item not found")
+    return {"message": "Cart item removed"}
+
+
+@api_router.post("/customer/checkout")
+async def customer_checkout(
+    data: CustomerCheckoutRequest,
+    customer: dict = Depends(require_customer),
+):
+    customer_items = await db.customer_cart.find({"user_id": customer["id"]}, {"_id": 0}).to_list(1000)
+    if not customer_items:
+        raise HTTPException(status_code=400, detail="Customer cart is empty")
+
+    shop_ids = {item["shop_id"] for item in customer_items}
+    if len(shop_ids) != 1:
+        raise HTTPException(status_code=400, detail="Customer cart must contain items from one shop")
+    checkout_shop_id = next(iter(shop_ids))
+
+    pos_cart_items = []
+    for item in customer_items:
+        product = await db.products.find_one(
+            {"id": item["product_id"], "shop_id": checkout_shop_id},
+            {"_id": 0},
+        )
+        if not product:
+            raise HTTPException(status_code=404, detail=f"Product {item['product_id']} not found")
+        if not product.get("is_active", True):
+            raise HTTPException(status_code=400, detail=f"Product {item['product_id']} is not active")
+        if product.get("stock_quantity", 0) < item["quantity"]:
+            raise HTTPException(status_code=400, detail=f"Insufficient stock for {product.get('name', item['product_id'])}")
+
+        pos_cart_items.append(
+            {
+                "id": item["id"],
+                "product_id": item["product_id"],
+                "quantity": item["quantity"],
+                "created_at": item.get("created_at", datetime.now(timezone.utc).isoformat()),
+            }
+        )
+
+    cart = await db.cart.find_one(
+        {"user_id": customer["id"], "shop_id": checkout_shop_id},
+        {"_id": 0},
+    )
+    cart_id = cart["id"] if cart else str(uuid.uuid4())
+    await db.cart.update_one(
+        {"id": cart_id},
+        {
+            "$set": {
+                "user_id": customer["id"],
+                "shop_id": checkout_shop_id,
+                "items": pos_cart_items,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            "$setOnInsert": {"id": cart_id},
+        },
+        upsert=True,
+    )
+
+    checkout_user = {**customer, "shop_id": checkout_shop_id}
+    checkout_result = await checkout_cart(
+        CheckoutRequest(
+            payment_method=data.payment_method,
+            customer_id=data.customer_id,
+        ),
+        checkout_user,
+    )
+
+    await db.orders.update_one(
+        {"id": checkout_result.id, "shop_id": checkout_shop_id},
+        {"$set": {"source": "customer_app"}},
+    )
+    await db.customer_cart.delete_many({"user_id": customer["id"]})
+
+    return {"order": checkout_result.model_dump(), "items": checkout_result.items}
 
 
 
@@ -2366,78 +2649,115 @@ async def cancel_order(order_id: str, user: dict = Depends(get_current_user)):
     return {"message": "Order cancelled", "order_id": order_id}
 
 async def checkout_cart(data: CheckoutRequest, user: dict):
-    cart = await db.cart.find_one(
-        {"user_id": user["id"], "shop_id": user["shop_id"]}, {"_id": 0}
-    )
-    if not cart or not cart.get("items"):
-        raise HTTPException(status_code=400, detail="Cart is empty")
-
-    order_items = []
-    total_amount = 0.0
-    for item in cart["items"]:
-
-        quantity = item.get("quantity", 0)
-
-        product = await db.products.find_one(
-            {"id": item["product_id"], "shop_id": user["shop_id"]}, {"_id": 0}
+    async def _run_checkout(session=None):
+        cart = await db.cart.find_one(
+            {"user_id": user["id"], "shop_id": user["shop_id"]}, {"_id": 0}
         )
-        if not product:
-            raise HTTPException(status_code=404, detail="Product not found")
+        if not cart or not cart.get("items"):
+            raise HTTPException(status_code=400, detail="Cart is empty")
 
+        order_items = []
+        total_amount = 0.0
+        for item in cart["items"]:
+            quantity = item["quantity"]
+            product = await db.products.find_one(
+                {"id": item["product_id"], "shop_id": user["shop_id"]}, {"_id": 0}
+            )
+            if not product:
+                raise HTTPException(status_code=404, detail="Product not found")
 
-        quantity = item["quantity"]
+            stock_update = await db.products.update_one(
+                {
+                    "id": product["id"],
+                    "shop_id": user["shop_id"],
+                    "stock_quantity": {"$gte": quantity},
+                },
+                {"$inc": {"stock_quantity": -quantity}},
+                session=session,
+            )
+            if stock_update.matched_count == 0:
+                raise HTTPException(status_code=400, detail="Insufficient stock")
 
-        if product["stock_quantity"] < quantity:
-            raise HTTPException(status_code=400, detail="Insufficient stock")
+            line_total = product.get("unit_price", 0) * quantity
+            total_amount += line_total
+            order_items.append(
+                {
+                    "id": str(uuid.uuid4()),
+                    "order_id": None,
+                    "shop_id": user["shop_id"],
+                    "product_id": product["id"],
+                    "product_name": product.get("name"),
+                    "quantity": quantity,
+                    "unit_price": product.get("unit_price", 0),
+                    "total": line_total,
+                    "item_id": item.get("id"),
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
 
-        await db.products.update_one(
-            {"id": product["id"], "shop_id": user["shop_id"]},
-            {"$inc": {"stock_quantity": -quantity}},
-        )
-        line_total = product.get("unit_price", 0) * quantity
-        total_amount += line_total
-        order_items.append(
+        order_id = str(uuid.uuid4())
+        for order_item in order_items:
+            order_item["order_id"] = order_id
+            await db.order_items.insert_one(order_item, session=session)
+
+        order = {
+            "id": order_id,
+            "shop_id": user["shop_id"],
+            "user_id": user["id"],
+            "total_amount": total_amount,
+            "status": "completed",
+            "customer_id": data.customer_id,
+            "payment_method": data.payment_method,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        await db.orders.insert_one(order, session=session)
+
+        if data.payment_method == "credit":
+            if not data.customer_id:
+                raise HTTPException(status_code=400, detail="customer_id is required for credit checkout")
+            await db.credit_customers.update_one(
+                {"id": data.customer_id, "shop_id": user["shop_id"]},
+                {"$inc": {"current_balance": total_amount}},
+                session=session,
+            )
+
+        payment_status = "successful" if data.payment_method != "credit" else "on_credit"
+        await db.payments.insert_one(
             {
                 "id": str(uuid.uuid4()),
-                "order_id": None,
+                "order_id": order_id,
                 "shop_id": user["shop_id"],
-                "product_id": product["id"],
-                "product_name": product.get("name"),
-                "quantity": quantity,
-                "unit_price": product.get("unit_price", 0),
-                "total": line_total,
-
-                "item_id": item.get("id"),
-
+                "amount": total_amount,
+                "method": data.payment_method,
+                "status": payment_status,
                 "created_at": datetime.now(timezone.utc).isoformat(),
-            }
+            },
+            session=session,
         )
 
-    order_id = str(uuid.uuid4())
-    for order_item in order_items:
-        order_item["order_id"] = order_id
-        await db.order_items.insert_one(order_item)
-
-    order = {
-        "id": order_id,
-        "shop_id": user["shop_id"],
-        "user_id": user["id"],
-        "total_amount": total_amount,
-        "status": "completed",
-
-        "customer_id": data.customer_id,
-        "payment_method": data.payment_method,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    await db.orders.insert_one(order)
-
-    if data.payment_method == "credit":
-        if not data.customer_id:
-            raise HTTPException(status_code=400, detail="customer_id is required for credit checkout")
-        await db.credit_customers.update_one(
-            {"id": data.customer_id, "shop_id": user["shop_id"]},
-            {"$inc": {"current_balance": total_amount}},
+        # Clear POS cart only after successful order + payment creation
+        await db.cart.update_one(
+            {"id": cart["id"]},
+            {"$set": {"items": [], "updated_at": datetime.now(timezone.utc).isoformat()}},
+            session=session,
         )
+        return CheckoutResponse(
+            id=order["id"],
+            total_amount=order["total_amount"],
+            shop_id=order["shop_id"],
+            status=order["status"],
+            payment_status=payment_status,
+            payment_method=data.payment_method,
+            customer_id=data.customer_id,
+            items=order_items,
+        )
+
+
+    if hasattr(client, "start_session"):
+        async with await client.start_session() as session:
+            async with session.start_transaction():
+                return await _run_checkout(session=session)
+    return await _run_checkout()
 
     payment_status = "successful" if data.payment_method != "credit" else "on_credit"
 
@@ -2467,6 +2787,7 @@ async def checkout_cart(data: CheckoutRequest, user: dict):
         customer_id=data.customer_id,
         items=order_items,
     )
+
 
 
 async def create_marketplace_order(data: MarketplaceOrderCreate, owner: dict):
@@ -2521,6 +2842,54 @@ async def compare_payment_providers(user: dict):
         "recommended_provider": "paystack",
         "guidance": f"Use Paystack for shop_id={user.get('shop_id')}",
     }
+
+
+def to_public_product_view(product: dict) -> PublicProductResponse:
+    return PublicProductResponse(
+        id=product["id"],
+        name=product.get("name", ""),
+        price=product.get("unit_price", 0),
+        image_url=product.get("image_url"),
+        description=product.get("description"),
+        availability="in_stock" if product.get("stock_quantity", 0) > 0 else "out_of_stock",
+    )
+
+
+@api_router.get("/public/stores", response_model=List[PublicStoreResponse])
+async def public_list_stores():
+    shops = await db.shops.find({}, {"_id": 0}).to_list(10000)
+    active_shops = [shop for shop in shops if shop.get("is_active", True)]
+    return [
+        PublicStoreResponse(
+            id=shop["id"],
+            name=shop.get("name", ""),
+            category=shop.get("category"),
+        )
+        for shop in active_shops
+    ]
+
+
+@api_router.get(
+    "/public/stores/{shop_id}/products",
+    response_model=List[PublicProductResponse],
+)
+async def public_list_store_products(shop_id: str):
+    shop = await db.shops.find_one({"id": shop_id}, {"_id": 0})
+    if not shop or not shop.get("is_active", True):
+        raise HTTPException(status_code=404, detail="Store not found")
+
+    products = await db.products.find({"shop_id": shop_id}, {"_id": 0}).to_list(10000)
+    active_products = [product for product in products if product.get("is_active", True)]
+    return [to_public_product_view(product) for product in active_products]
+
+
+@api_router.get("/public/products/{product_id}", response_model=PublicProductResponse)
+async def public_get_product(product_id: str):
+    product = await db.products.find_one({"id": product_id}, {"_id": 0})
+    if not product or not product.get("is_active", True):
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    return to_public_product_view(product)
 
 
 # =============================================================================
