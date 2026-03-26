@@ -15,7 +15,7 @@ export default function OrdersPage() {
     try {
       const query = status ? `?status=${encodeURIComponent(status)}` : '';
       const data = await api.get(`/orders${query}`);
-      setOrders(data);
+      setOrders(Array.isArray(data) ? data : (data?.data || []));
     } catch (error) {
       toast.error(error.message || 'Failed to load orders');
     } finally {
@@ -46,9 +46,9 @@ export default function OrdersPage() {
           <Card key={order.id}>
             <CardHeader className="pb-3">
               <div className="flex items-center justify-between gap-2">
-                <CardTitle className="text-base">{order.order_number}</CardTitle>
+                <CardTitle className="text-base">{order.order_number || order.id}</CardTitle>
                 <div className="flex gap-2">
-                  <Badge variant="secondary">{order.payment_status}</Badge>
+                  <Badge variant="secondary">{order.payment_status || 'unknown'}</Badge>
                   <Badge>{order.status}</Badge>
                 </div>
               </div>
@@ -58,7 +58,7 @@ export default function OrdersPage() {
               <div className="flex justify-between"><span>Payment</span><span>{order.payment_method}</span></div>
               <div className="flex justify-between"><span>Created</span><span>{formatDate(order.created_at)}</span></div>
               <div className="pt-2 border-t">
-                {order.items.map((item) => (
+                {(order.items || []).map((item) => (
                   <div key={`${order.id}-${item.product_id}`} className="flex justify-between py-1">
                     <span>{item.product_name} × {item.quantity}</span>
                     <span>{formatCurrency(item.total)}</span>

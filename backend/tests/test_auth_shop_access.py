@@ -33,12 +33,19 @@ class FakeCollection:
 
     def _matches(self, document, query):
         for key, value in query.items():
-            if isinstance(value, dict) and '$in' in value:
-                if document.get(key) not in value['$in']:
+            if isinstance(value, dict):
+                actual = document.get(key)
+                if '$in' in value and actual not in value['$in']:
                     return False
-            else:
-                if document.get(key) != value:
+                if '$gte' in value and (actual is None or actual < value['$gte']):
                     return False
+                if '$lte' in value and (actual is None or actual > value['$lte']):
+                    return False
+                if '$lt' in value and (actual is None or actual >= value['$lt']):
+                    return False
+                continue
+            if document.get(key) != value:
+                return False
         return True
 
     async def find_one(self, query, projection=None, sort=None):
@@ -82,6 +89,11 @@ class FakeCollection:
         self.documents = [doc for doc in self.documents if not self._matches(doc, query)]
         return SimpleNamespace(deleted_count=before - len(self.documents))
 
+    async def delete_many(self, query):
+        before = len(self.documents)
+        self.documents = [doc for doc in self.documents if not self._matches(doc, query)]
+        return SimpleNamespace(deleted_count=before - len(self.documents))
+
 
 class FakeDB:
     def __init__(self, **collections):
@@ -98,6 +110,7 @@ class FakeDB:
             'payments': [],
             'notifications': [],
             'mpesa_transactions': [],
+            'customer_cart': [],
         }
         defaults.update(collections)
         for name, documents in defaults.items():
@@ -248,3 +261,61 @@ async def test_payment_provider_comparison_recommends_paystack():
 
     assert comparison['recommended_provider'] == 'paystack'
     assert 'shop_id' in comparison['guidance']
+
+
+@pytest.mark.asyncio
+async def test_damaged_stock_updates_only_current_shop_product(monkeypatch):
+    fake_db = FakeDB(
+        products=[
+            {'id': 'shared-prod', 'shop_id': 'shop-2', 'name': 'Other shop', 'stock_quantity': 20, 'created_at': 'now'},
+            {'id': 'shared-prod', 'shop_id': 'shop-1', 'name': 'Current shop', 'stock_quantity': 10, 'created_at': 'now'},
+        ],
+        damaged_stock=[],
+    )
+    monkeypatch.setattr(server, 'db', fake_db)
+    monkeypatch.setattr(server, 'client', SimpleNamespace())
+
+    user = {'id': 'owner-1', 'shop_id': 'shop-1', 'role': 'owner'}
+    await server.create_damaged_stock(
+        server.DamagedStockCreate(product_id='shared-prod', quantity=3, reason='damaged'),
+        user=user,
+    )
+
+    assert fake_db.products.documents[0]['stock_quantity'] == 20
+    assert fake_db.products.documents[1]['stock_quantity'] == 7
+
+
+@pytest.mark.asyncio
+async def test_purchase_updates_only_current_shop_product(monkeypatch):
+    fake_db = FakeDB(
+        suppliers=[{'id': 'sup-1', 'shop_id': 'shop-1', 'name': 'Vendor', 'phone': '0700', 'created_at': 'now'}],
+        products=[
+            {'id': 'shared-prod', 'shop_id': 'shop-2', 'name': 'Other shop', 'stock_quantity': 20, 'created_at': 'now'},
+            {'id': 'shared-prod', 'shop_id': 'shop-1', 'name': 'Current shop', 'stock_quantity': 5, 'created_at': 'now'},
+        ],
+        purchases=[],
+    )
+    monkeypatch.setattr(server, 'db', fake_db)
+    monkeypatch.setattr(server, 'client', SimpleNamespace())
+
+    user = {'id': 'owner-1', 'shop_id': 'shop-1', 'role': 'owner'}
+    await server.create_purchase(
+        server.PurchaseCreate(
+            supplier_id='sup-1',
+            items=[
+                server.PurchaseItem(
+                    product_id='shared-prod',
+                    product_name='Current shop',
+                    quantity=2,
+                    unit_type='package',
+                    units_per_package=4,
+                    cost=80,
+                )
+            ],
+            total_cost=80,
+        ),
+        user=user,
+    )
+
+    assert fake_db.products.documents[0]['stock_quantity'] == 20
+    assert fake_db.products.documents[1]['stock_quantity'] == 13
