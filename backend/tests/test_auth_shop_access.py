@@ -69,6 +69,13 @@ class FakeCollection:
                 if '$inc' in update:
                     for key, value in update['$inc'].items():
                         document[key] = document.get(key, 0) + value
+                if '$push' in update:
+                    for key, value in update['$push'].items():
+                        existing = document.get(key, [])
+                        if not isinstance(existing, list):
+                            existing = [existing]
+                        existing.append(value)
+                        document[key] = existing
                 if '$setOnInsert' in update:
                     for key, value in update['$setOnInsert'].items():
                         document.setdefault(key, value)
@@ -95,6 +102,11 @@ class FakeCollection:
         return SimpleNamespace(deleted_count=before - len(self.documents))
 
 
+    async def create_index(self, *args, **kwargs):
+        return None
+
+
+
 class FakeDB:
     def __init__(self, **collections):
         defaults = {
@@ -111,6 +123,9 @@ class FakeDB:
             'notifications': [],
             'mpesa_transactions': [],
             'customer_cart': [],
+
+            'checkout_requests': [],
+
         }
         defaults.update(collections)
         for name, documents in defaults.items():
@@ -252,6 +267,65 @@ async def test_marketplace_delivery_updates_stock_and_payment(monkeypatch):
     assert delivered['status'] == 'delivered'
     assert fake_db.products.documents[0]['stock_quantity'] == 6
     assert fake_db.payments.documents[0]['status'] == 'successful'
+
+
+@pytest.mark.asyncio
+async def test_marketplace_order_uses_checkout_cart(monkeypatch):
+    fake_db = FakeDB(
+        suppliers=[{'id': 'supplier-1', 'name': 'Vendor', 'phone': '0700', 'shop_id': 'shop-1', 'created_at': 'now'}],
+        products=[{'id': 'prod-1', 'name': 'Milk', 'shop_id': 'shop-1', 'stock_quantity': 10, 'unit_price': 30.0, 'created_at': 'now'}],
+    )
+    monkeypatch.setattr(server, 'db', fake_db)
+    monkeypatch.setattr(server, 'client', SimpleNamespace())
+
+    called = {'value': False}
+
+    async def fake_checkout_cart(data, user):
+        called['value'] = True
+        order_id = 'order-from-checkout'
+        fake_db.orders.documents.append({
+            'id': order_id,
+            'shop_id': user['shop_id'],
+            'user_id': user['id'],
+            'status': 'completed',
+            'payment_method': data.payment_method,
+            'total_amount': 120.0,
+            'created_at': 'now',
+        })
+        fake_db.payments.documents.append({
+            'id': 'payment-1',
+            'order_id': order_id,
+            'shop_id': user['shop_id'],
+            'amount': 120.0,
+            'method': data.payment_method,
+            'status': 'pending',
+            'created_at': 'now',
+        })
+        return server.CheckoutResponse(
+            id=order_id,
+            total_amount=120.0,
+            shop_id=user['shop_id'],
+            status='completed',
+            payment_status='pending',
+            payment_method=data.payment_method,
+            items=[],
+        )
+
+    monkeypatch.setattr(server, 'checkout_cart', fake_checkout_cart)
+
+    owner = {'id': 'owner-1', 'shop_id': 'shop-1', 'role': 'owner'}
+    created = await server.create_marketplace_order(
+        server.MarketplaceOrderCreate(
+            vendor_id='supplier-1',
+            payment_method='mpesa',
+            items=[server.MarketplaceOrderItem(product_id='prod-1', product_name='Milk', quantity=2, unit_cost=50)],
+        ),
+        owner=owner,
+    )
+
+    assert called['value'] is True
+    assert created['id'] == 'order-from-checkout'
+    assert created['status'] == 'pending'
 
 
 @pytest.mark.asyncio
