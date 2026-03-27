@@ -5,6 +5,7 @@ import uuid
 import hmac
 import hashlib
 import json
+import re
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -78,6 +79,14 @@ class FakeCollection:
                 if not any(self._matches(document, item) for item in value):
                     return False
                 continue
+            if key == '$text':
+                search_text = str((value or {}).get('$search') or '').strip().lower()
+                searchable = f"{document.get('name', '')} {document.get('description', '')}".lower()
+                if not search_text:
+                    return False
+                if search_text not in searchable:
+                    return False
+                continue
             if key == '$expr':
                 if '$lte' in value:
                     left, right = value['$lte']
@@ -98,9 +107,11 @@ class FakeCollection:
                 if '$lt' in value and actual >= value['$lt']:
                     return False
                 if '$regex' in value:
-                    needle = value['$regex'].lower()
-                    haystack = str(actual or '').lower()
-                    if needle not in haystack:
+                    pattern = value['$regex']
+                    flags = 0
+                    if value.get('$options') and 'i' in value.get('$options'):
+                        flags |= re.IGNORECASE
+                    if not re.search(pattern, str(actual or ''), flags):
                         return False
                 continue
 
@@ -183,6 +194,47 @@ class FakeCollection:
     async def create_index(self, *args, **kwargs):
         self.indexes.append({"args": args, "kwargs": kwargs})
         return None
+
+    def aggregate(self, pipeline):
+        documents = [deepcopy(document) for document in self.documents]
+        for stage in pipeline:
+            if "$match" in stage:
+                query = stage["$match"]
+                documents = [doc for doc in documents if self._matches(doc, query)]
+            elif "$group" in stage:
+                group_stage = stage["$group"]
+                group_field = str(group_stage.get("_id", "")).lstrip("$")
+                grouped = {}
+                for doc in documents:
+                    key = doc.get(group_field)
+                    bucket = grouped.setdefault(key, {})
+                    for output_field, expression in group_stage.items():
+                        if output_field == "_id":
+                            continue
+                        if isinstance(expression, dict) and "$sum" in expression:
+                            sum_value = expression["$sum"]
+                            increment = 0
+                            if isinstance(sum_value, (int, float)):
+                                increment = sum_value
+                            elif isinstance(sum_value, str) and sum_value.startswith("$"):
+                                increment = doc.get(sum_value.lstrip("$"), 0) or 0
+                            elif isinstance(sum_value, dict) and "$ifNull" in sum_value:
+                                field_expr, default = sum_value["$ifNull"]
+                                field_name = str(field_expr).lstrip("$")
+                                increment = doc.get(field_name, default) or default
+                            bucket[output_field] = bucket.get(output_field, 0) + increment
+                documents = [{"_id": key, **value} for key, value in grouped.items()]
+            elif "$sort" in stage:
+                sort_stage = stage["$sort"]
+                sort_key, direction = next(iter(sort_stage.items()))
+                documents = sorted(
+                    documents,
+                    key=lambda item: item.get(sort_key, 0),
+                    reverse=direction == -1,
+                )
+            elif "$limit" in stage:
+                documents = documents[: int(stage["$limit"])]
+        return FakeCursor(documents)
 
 
 class FakeDB:
@@ -1020,6 +1072,26 @@ class TestCartAndOrders:
         assert first.status_code == 200
         assert second.status_code == 200
         assert first.json()['order']['id'] == second.json()['order']['id']
+        owner_orders = [order for order in server.db.orders.documents if order.get('user_id') == TEST_USER_ID]
+        owner_payments = [payment for payment in server.db.payments.documents if payment.get('shop_id') == TEST_SHOP_ID]
+        assert len(owner_orders) == 1
+        assert len(owner_payments) == 1
+
+    def test_checkout_idempotency_processing_state_blocks_reentry(self, client, auth_headers):
+        server.db.checkout_requests.documents.append({
+            'key': 'idem-processing',
+            'user_id': TEST_USER_ID,
+            'status': 'processing',
+            'created_at': 'now',
+        })
+        product = client.post('/api/products', json={'name': 'Blocking Product', 'unit_price': 60.0, 'stock_quantity': 10}, headers=auth_headers).json()
+        client.post('/api/cart', json={'product_id': product['id'], 'quantity': 1}, headers=auth_headers)
+        response = client.post(
+            '/api/orders/checkout',
+            json={'payment_method': 'cash'},
+            headers={**auth_headers, 'Idempotency-Key': 'idem-processing'},
+        )
+        assert response.status_code == 409
 
     def test_checkout_idempotency_different_key_creates_new_order(self, client, auth_headers):
         product = client.post('/api/products', json={'name': 'Idempotent Product 2', 'unit_price': 70.0, 'stock_quantity': 10}, headers=auth_headers).json()
@@ -1192,7 +1264,26 @@ class TestOrderLifecycle:
 
 
 class TestPublicCatalog:
+    def test_public_categories_endpoint(self, client):
+        response = client.get('/api/public/categories')
+        assert response.status_code == 200
+        payload = response.json()
+        assert isinstance(payload, list)
+        assert {'id': 'food', 'name': 'Food'} in payload
+
+    def test_public_home_structure(self, client):
+        server.db.shops.documents[0]['subscription'] = {'plan': 'online', 'status': 'active', 'expires_at': None}
+        response = client.get('/api/public/home')
+        assert response.status_code == 200
+        payload = response.json()
+        assert set(payload.keys()) == {'categories', 'featured_stores', 'popular_stores', 'new_stores'}
+        assert isinstance(payload['categories'], list)
+        assert isinstance(payload['featured_stores'], list)
+        assert isinstance(payload['popular_stores'], list)
+        assert isinstance(payload['new_stores'], list)
+
     def test_public_stores_list(self, client):
+        server.db.shops.documents[0]['subscription'] = {'plan': 'online', 'status': 'active', 'expires_at': None}
         response = client.get('/api/public/stores')
         assert response.status_code == 200, response.text
         payload = response.json()
@@ -1202,16 +1293,42 @@ class TestPublicCatalog:
 
 
     def test_public_stores_pagination(self, client):
+        server.db.shops.documents[0]['subscription'] = {'plan': 'online', 'status': 'active', 'expires_at': None}
         server.db.shops.documents.extend([
-            {'id': 'shop-2', 'name': 'Shop 2', 'owner_id': TEST_USER_ID, 'created_at': 'now', 'is_active': True},
-            {'id': 'shop-3', 'name': 'Shop 3', 'owner_id': TEST_USER_ID, 'created_at': 'now', 'is_active': True},
+            {'id': 'shop-2', 'name': 'Shop 2', 'owner_id': TEST_USER_ID, 'created_at': 'now', 'is_active': True, 'subscription': {'plan': 'online', 'status': 'active', 'expires_at': None}},
+            {'id': 'shop-3', 'name': 'Shop 3', 'owner_id': TEST_USER_ID, 'created_at': 'now', 'is_active': True, 'subscription': {'plan': 'online', 'status': 'active', 'expires_at': None}},
         ])
         response = client.get('/api/public/stores?limit=1&offset=1')
         assert response.status_code == 200
         assert len(response.json()) == 1
 
+    def test_public_stores_filtering_by_category_and_search(self, client):
+        server.db.shops.documents[0].update({
+            'name': 'Food Hub',
+            'category': 'food',
+            'subscription': {'plan': 'online', 'status': 'active', 'expires_at': None},
+        })
+        server.db.shops.documents.append({
+            'id': 'shop-2',
+            'name': 'Medi Store',
+            'category': 'pharmacy',
+            'owner_id': TEST_USER_ID,
+            'created_at': 'now',
+            'is_active': True,
+            'subscription': {'plan': 'online', 'status': 'active', 'expires_at': None},
+        })
+        by_category = client.get('/api/public/stores?category=food')
+        assert by_category.status_code == 200
+        assert all((store.get('category') or '').lower() == 'food' for store in by_category.json())
+
+        by_search = client.get('/api/public/stores?search=medi')
+        assert by_search.status_code == 200
+        assert len(by_search.json()) == 1
+        assert by_search.json()[0]['name'] == 'Medi Store'
+
 
     def test_public_store_products_filters_inactive_and_hides_internal_fields(self, client, auth_headers):
+        server.db.shops.documents[0]['subscription'] = {'plan': 'online', 'status': 'active', 'expires_at': None}
         active_product = client.post('/api/products', json={
             'name': 'Public Active',
             'unit_price': 120.0,
@@ -1238,11 +1355,13 @@ class TestPublicCatalog:
         assert all(product['name'] != 'Public Inactive' for product in products)
         assert all('cost_price' not in product for product in products)
         assert all(
-            set(product.keys()) == {'id', 'name', 'price', 'image_url', 'description', 'availability'}
+            set(product.keys()) == {'id', 'shop_id', 'name', 'price', 'image_url', 'description', 'availability'}
             for product in products
         )
+        assert all(product['shop_id'] == TEST_SHOP_ID for product in products)
 
     def test_public_single_product_view(self, client, auth_headers):
+        server.db.shops.documents[0]['subscription'] = {'plan': 'online', 'status': 'active', 'expires_at': None}
         in_stock = client.post('/api/products', json={
             'name': 'Single Product',
             'unit_price': 99.0,
@@ -1265,19 +1384,399 @@ class TestPublicCatalog:
         in_stock_response = client.get(f"/api/public/products/{in_stock['id']}")
         assert in_stock_response.status_code == 200
         assert in_stock_response.json()['availability'] == 'in_stock'
+        assert in_stock_response.json()['shop_id'] == TEST_SHOP_ID
 
         out_stock_response = client.get(f"/api/public/products/{out_of_stock['id']}")
         assert out_stock_response.status_code == 200
         assert out_stock_response.json()['availability'] == 'out_of_stock'
+        assert out_stock_response.json()['shop_id'] == TEST_SHOP_ID
 
         inactive_response = client.get(f"/api/public/products/{inactive['id']}")
         assert inactive_response.status_code == 404
 
 
     def test_public_products_list_pagination(self, client, auth_headers):
+        server.db.shops.documents[0]['subscription'] = {'plan': 'online', 'status': 'active', 'expires_at': None}
         client.post('/api/products', json={'name': 'Public List A', 'unit_price': 20.0, 'stock_quantity': 5, 'is_active': True}, headers=auth_headers)
         client.post('/api/products', json={'name': 'Public List B', 'unit_price': 25.0, 'stock_quantity': 5, 'is_active': True}, headers=auth_headers)
         response = client.get('/api/public/products?limit=1&offset=0')
         assert response.status_code == 200
         assert len(response.json()) == 1
+        assert response.json()[0]['shop_id'] == TEST_SHOP_ID
 
+    def test_public_product_search(self, client, auth_headers):
+        server.db.shops.documents[0]['subscription'] = {'plan': 'online', 'status': 'active', 'expires_at': None}
+        client.post('/api/products', json={
+            'name': 'Vitamin C',
+            'unit_price': 100.0,
+            'stock_quantity': 5,
+            'description': 'Immune support tablets',
+            'is_active': True,
+        }, headers=auth_headers)
+        client.post('/api/products', json={
+            'name': 'Battery AA',
+            'unit_price': 60.0,
+            'stock_quantity': 8,
+            'description': 'Electronics battery',
+            'is_active': True,
+        }, headers=auth_headers)
+        response = client.get('/api/public/products/search?q=immune')
+        assert response.status_code == 200
+        payload = response.json()
+        assert len(payload) == 1
+        assert payload[0]['name'] == 'Vitamin C'
+        assert payload[0]['shop_id'] == TEST_SHOP_ID
+
+    def test_public_product_search_prefers_name_exact_match(self, client, auth_headers):
+        server.db.shops.documents[0]['subscription'] = {'plan': 'online', 'status': 'active', 'expires_at': None}
+        client.post('/api/products', json={
+            'name': 'Immune',
+            'unit_price': 100.0,
+            'stock_quantity': 5,
+            'description': 'General supplement',
+            'is_active': True,
+        }, headers=auth_headers)
+        client.post('/api/products', json={
+            'name': 'Wellness Pack',
+            'unit_price': 100.0,
+            'stock_quantity': 5,
+            'description': 'Immune support bundle',
+            'is_active': True,
+        }, headers=auth_headers)
+        response = client.get('/api/public/products/search?q=immune')
+        assert response.status_code == 200
+        payload = response.json()
+        assert len(payload) >= 2
+        assert payload[0]['name'] == 'Immune'
+
+    def test_public_product_search_sanitizes_regex(self, client, auth_headers):
+        server.db.shops.documents[0]['subscription'] = {'plan': 'online', 'status': 'active', 'expires_at': None}
+        client.post('/api/products', json={
+            'name': 'Literal Dot Star',
+            'unit_price': 100.0,
+            'stock_quantity': 5,
+            'description': 'contains dot-star text',
+            'is_active': True,
+        }, headers=auth_headers)
+        response = client.get('/api/public/products/search?q=.*')
+        assert response.status_code == 200
+        assert response.json() == []
+
+    def test_public_products_pagination_filters_before_paginating(self, client, auth_headers):
+        server.db.shops.documents[0].update({
+            'subscription': {'plan': 'online', 'status': 'active', 'expires_at': None},
+            'is_active': True,
+        })
+        server.db.shops.documents.append({
+            'id': 'pos-shop',
+            'name': 'POS Shop',
+            'owner_id': TEST_USER_ID,
+            'created_at': 'now',
+            'is_active': True,
+            'subscription': {'plan': 'pos', 'status': 'active', 'expires_at': None},
+        })
+        for idx in range(5):
+            server.db.products.documents.append({
+                'id': f'pos-p-{idx}',
+                'shop_id': 'pos-shop',
+                'name': f'POS Product {idx}',
+                'unit_price': 10.0,
+                'is_active': True,
+                'stock_quantity': 1,
+            })
+        for idx in range(3):
+            server.db.products.documents.append({
+                'id': f'online-p-{idx}',
+                'shop_id': TEST_SHOP_ID,
+                'name': f'Online Product {idx}',
+                'unit_price': 20.0,
+                'is_active': True,
+                'stock_quantity': 1,
+            })
+        response = client.get('/api/public/products?limit=2&offset=0')
+        assert response.status_code == 200
+        payload = response.json()
+        assert len(payload) == 2
+        assert all(item['shop_id'] == TEST_SHOP_ID for item in payload)
+
+    def test_public_products_query_avoids_shop_find_one_n_plus_one(self, client, auth_headers, monkeypatch):
+        server.db.shops.documents[0]['subscription'] = {'plan': 'online', 'status': 'active', 'expires_at': None}
+        client.post('/api/products', json={
+            'name': 'Batch Product',
+            'unit_price': 45.0,
+            'stock_quantity': 4,
+            'is_active': True,
+        }, headers=auth_headers)
+        calls = {'count': 0}
+        original_find_one = server.db.shops.find_one
+
+        async def tracked_find_one(*args, **kwargs):
+            calls['count'] += 1
+            return await original_find_one(*args, **kwargs)
+
+        monkeypatch.setattr(server.db.shops, 'find_one', tracked_find_one)
+        response = client.get('/api/public/products?limit=10&offset=0')
+        assert response.status_code == 200
+        assert calls['count'] == 0
+
+    def test_public_home_has_no_duplicate_stores_across_sections(self, client):
+        base_shop = server.db.shops.documents[0]
+        base_shop.update({
+            'subscription': {'plan': 'online', 'status': 'active', 'expires_at': None},
+            'is_active': True,
+            'is_featured': True,
+        })
+        server.db.shops.documents.append({
+            'id': 'shop-2',
+            'name': 'Fresh Shop',
+            'owner_id': TEST_USER_ID,
+            'category': 'food',
+            'created_at': '2026-03-23T00:00:00+00:00',
+            'is_active': True,
+            'subscription': {'plan': 'online', 'status': 'active', 'expires_at': None},
+        })
+        server.db.orders.documents.append({'id': 'order-1', 'shop_id': TEST_SHOP_ID})
+        server.db.orders.documents.append({'id': 'order-2', 'shop_id': 'shop-2'})
+
+        response = client.get('/api/public/home')
+        assert response.status_code == 200
+        payload = response.json()
+        featured_ids = {store['id'] for store in payload['featured_stores']}
+        popular_ids = {store['id'] for store in payload['popular_stores']}
+        new_ids = {store['id'] for store in payload['new_stores']}
+        assert featured_ids.isdisjoint(popular_ids)
+        assert featured_ids.isdisjoint(new_ids)
+        assert popular_ids.isdisjoint(new_ids)
+
+    def test_public_home_popularity_still_returns_store_list_shape(self, client):
+        server.db.shops.documents[0].update({
+            'subscription': {'plan': 'online', 'status': 'active', 'expires_at': None},
+            'is_active': True,
+        })
+        server.db.orders.documents.append({'id': 'order-1', 'shop_id': TEST_SHOP_ID, 'total_amount': 300.0})
+        response = client.get('/api/public/home')
+        assert response.status_code == 200
+        payload = response.json()
+        assert isinstance(payload['popular_stores'], list)
+        assert all(set(store.keys()) <= {'id', 'name', 'category'} for store in payload['popular_stores'])
+
+    def test_public_empty_catalog_returns_safe_lists(self, client):
+        server.db.shops.documents = []
+        server.db.products.documents = []
+        stores = client.get('/api/public/stores')
+        products = client.get('/api/public/products')
+        home = client.get('/api/public/home')
+        assert stores.status_code == 200
+        assert products.status_code == 200
+        assert home.status_code == 200
+        assert stores.json() == []
+        assert products.json() == []
+        assert home.json()['featured_stores'] == []
+        assert home.json()['popular_stores'] == []
+        assert home.json()['new_stores'] == []
+
+    def test_public_product_without_image_returns_null(self, client, auth_headers):
+        server.db.shops.documents[0]['subscription'] = {'plan': 'online', 'status': 'active', 'expires_at': None}
+        product = client.post('/api/products', json={
+            'name': 'No Image Product',
+            'unit_price': 12.0,
+            'stock_quantity': 4,
+            'is_active': True,
+        }, headers=auth_headers).json()
+        response = client.get(f"/api/public/products/{product['id']}")
+        assert response.status_code == 200
+        assert response.json()['image_url'] is None
+
+    def test_public_products_optional_category_filter(self, client, auth_headers):
+        server.db.shops.documents[0].update({
+            'category': 'food',
+            'subscription': {'plan': 'online', 'status': 'active', 'expires_at': None},
+        })
+        server.db.shops.documents.append({
+            'id': 'shop-2',
+            'name': 'Pharma Store',
+            'category': 'pharmacy',
+            'owner_id': TEST_USER_ID,
+            'created_at': 'now',
+            'is_active': True,
+            'subscription': {'plan': 'online', 'status': 'active', 'expires_at': None},
+        })
+        client.post('/api/products', json={'name': 'Food Item', 'unit_price': 20.0, 'stock_quantity': 2, 'is_active': True}, headers=auth_headers)
+        server.db.products.documents.append({
+            'id': 'shop-2-prod',
+            'shop_id': 'shop-2',
+            'name': 'Pharma Item',
+            'unit_price': 30.0,
+            'stock_quantity': 2,
+            'is_active': True,
+        })
+        response = client.get('/api/public/products?category=food')
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload
+        assert all(item['shop_id'] == TEST_SHOP_ID for item in payload)
+
+    def test_public_category_normalization_variants(self, client):
+        server.db.shops.documents[0].update({
+            'subscription': {'plan': 'online', 'status': 'active', 'expires_at': None},
+            'category': ' Food ',
+        })
+        server.db.shops.documents.append({
+            'id': 'shop-2',
+            'name': 'Mystery Shop',
+            'category': 'UNKNOWN_SEGMENT',
+            'owner_id': TEST_USER_ID,
+            'created_at': 'now',
+            'is_active': True,
+            'subscription': {'plan': 'online', 'status': 'active', 'expires_at': None},
+        })
+        response = client.get('/api/public/stores')
+        assert response.status_code == 200
+        by_id = {store['id']: store for store in response.json()}
+        assert by_id[TEST_SHOP_ID]['category'] == 'food'
+        assert by_id['shop-2']['category'] == 'other'
+
+    def test_pos_shop_not_visible_in_public_stores(self, client):
+        server.db.shops.documents[0]['subscription'] = {'plan': 'pos', 'status': 'active', 'expires_at': None}
+        response = client.get('/api/public/stores')
+        assert response.status_code == 200
+        assert all(store['id'] != TEST_SHOP_ID for store in response.json())
+
+    def test_online_shop_visible_in_public_stores(self, client):
+        server.db.shops.documents[0]['subscription'] = {'plan': 'online', 'status': 'active', 'expires_at': None}
+        response = client.get('/api/public/stores')
+        assert response.status_code == 200
+        assert any(store['id'] == TEST_SHOP_ID for store in response.json())
+
+    def test_upgrade_and_downgrade_changes_public_visibility(self, client, auth_headers):
+        server.db.shops.documents[0]['subscription'] = {'plan': 'pos', 'status': 'active', 'expires_at': None}
+        initial = client.get('/api/public/stores')
+        assert all(store['id'] != TEST_SHOP_ID for store in initial.json())
+
+        upgrade = client.put('/api/shop', json={'subscription': {'plan': 'online'}}, headers=auth_headers)
+        assert upgrade.status_code == 200, upgrade.text
+        upgraded = client.get('/api/public/stores')
+        assert any(store['id'] == TEST_SHOP_ID for store in upgraded.json())
+
+        downgrade = client.put('/api/shop', json={'subscription': {'plan': 'pos'}}, headers=auth_headers)
+        assert downgrade.status_code == 200, downgrade.text
+        downgraded = client.get('/api/public/stores')
+        assert all(store['id'] != TEST_SHOP_ID for store in downgraded.json())
+
+
+class TestSubscriptionFeatureGating:
+    def test_invalid_plan_defaults_to_pos(self, client, auth_headers):
+        server.db.shops.documents[0]['subscription'] = {'plan': 'gold', 'status': 'active', 'expires_at': None}
+        response = client.get('/api/shop', headers=auth_headers)
+        assert response.status_code == 200
+        assert response.json()['subscription']['plan'] == 'pos'
+
+    def test_expired_shop_blocked_from_pos_endpoint(self, client, auth_headers):
+        server.db.shops.documents[0]['subscription'] = {'plan': 'pos', 'status': 'expired', 'expires_at': None}
+        response = client.get('/api/products', headers=auth_headers)
+        assert response.status_code == 403
+        assert 'expired' in response.json()['detail'].lower()
+
+    def test_customer_checkout_blocked_for_pos_only_shop(self, client):
+        customer_id = 'customer-1'
+        server.db.users.documents.append({
+            'id': customer_id,
+            'phone': '0799000000',
+            'pin_hash': server.hash_pin('1234'),
+            'name': 'Customer',
+            'role': 'customer',
+            'created_at': '2026-03-22T00:00:00+00:00',
+        })
+        login = client.post('/api/auth/login', json={'phone': '0799000000', 'pin': '1234'})
+        assert login.status_code == 200, login.text
+        customer_headers = {'Authorization': f"Bearer {login.json()['token']}"}
+
+        server.db.shops.documents[0]['subscription'] = {'plan': 'pos', 'status': 'active', 'expires_at': None}
+        product = {
+            'id': str(uuid.uuid4()),
+            'name': 'POS Only Product',
+            'shop_id': TEST_SHOP_ID,
+            'unit_price': 100.0,
+            'stock_quantity': 10,
+            'is_active': True,
+            'created_at': '2026-03-22T00:00:00+00:00',
+            'updated_at': '2026-03-22T00:00:00+00:00',
+        }
+        server.db.products.documents.append(product)
+        server.db.customer_cart.documents.append({
+            'id': 'customer-cart-1',
+            'user_id': customer_id,
+            'product_id': product['id'],
+            'shop_id': TEST_SHOP_ID,
+            'quantity': 1,
+            'created_at': '2026-03-22T00:00:00+00:00',
+        })
+
+        checkout = client.post(
+            '/api/customer/checkout',
+            json={'payment_method': 'cash', 'customer_name': 'Customer'},
+            headers=customer_headers,
+        )
+        assert checkout.status_code == 403
+        assert checkout.json()['detail'] == 'Online store not enabled'
+
+    def test_customer_checkout_rejects_mixed_shop_cart(self, client):
+        customer_id = 'customer-2'
+        server.db.users.documents.append({
+            'id': customer_id,
+            'phone': '0799000001',
+            'pin_hash': server.hash_pin('1234'),
+            'name': 'Customer 2',
+            'role': 'customer',
+            'created_at': '2026-03-22T00:00:00+00:00',
+        })
+        server.db.shops.documents.extend([
+            {'id': 'shop-x', 'name': 'X', 'owner_id': TEST_USER_ID, 'created_at': 'now', 'subscription': {'plan': 'online', 'status': 'active', 'expires_at': None}},
+            {'id': 'shop-y', 'name': 'Y', 'owner_id': TEST_USER_ID, 'created_at': 'now', 'subscription': {'plan': 'online', 'status': 'active', 'expires_at': None}},
+        ])
+        server.db.customer_cart.documents.extend([
+            {'id': 'mix-1', 'user_id': customer_id, 'product_id': 'p1', 'shop_id': 'shop-x', 'quantity': 1, 'created_at': 'now'},
+            {'id': 'mix-2', 'user_id': customer_id, 'product_id': 'p2', 'shop_id': 'shop-y', 'quantity': 1, 'created_at': 'now'},
+        ])
+        login = client.post('/api/auth/login', json={'phone': '0799000001', 'pin': '1234'})
+        headers = {'Authorization': f"Bearer {login.json()['token']}"}
+        response = client.post('/api/customer/checkout', json={'payment_method': 'cash'}, headers=headers)
+        assert response.status_code == 400
+        assert 'one shop' in response.json()['detail']
+
+    def test_customer_checkout_idempotency_returns_same_response(self, client, auth_headers):
+        server.db.shops.documents[0]['subscription'] = {'plan': 'online', 'status': 'active', 'expires_at': None}
+        customer_id = 'customer-3'
+        server.db.users.documents.append({
+            'id': customer_id,
+            'phone': '0799000002',
+            'pin_hash': server.hash_pin('1234'),
+            'name': 'Customer 3',
+            'role': 'customer',
+            'created_at': '2026-03-22T00:00:00+00:00',
+        })
+        product = client.post('/api/products', json={
+            'name': 'Idempotent Product',
+            'unit_price': 100.0,
+            'stock_quantity': 10,
+            'is_active': True,
+        }, headers=auth_headers).json()
+        server.db.customer_cart.documents.append({
+            'id': 'idem-cart-1',
+            'user_id': customer_id,
+            'product_id': product['id'],
+            'shop_id': TEST_SHOP_ID,
+            'quantity': 1,
+            'created_at': 'now',
+        })
+        login = client.post('/api/auth/login', json={'phone': '0799000002', 'pin': '1234'})
+        headers = {
+            'Authorization': f"Bearer {login.json()['token']}",
+            'Idempotency-Key': 'idem-key-1',
+        }
+        first = client.post('/api/customer/checkout', json={'payment_method': 'cash'}, headers=headers)
+        second = client.post('/api/customer/checkout', json={'payment_method': 'cash'}, headers=headers)
+
+        assert first.status_code == 200, first.text
+        assert second.status_code == 200, second.text
+        assert first.json()['order']['id'] == second.json()['order']['id']

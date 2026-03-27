@@ -57,6 +57,30 @@ class FakeCollection:
             return None
         return {k: v for k, v in docs[0].items() if k != '_id'}
 
+    def find(self, query, projection=None):
+        matches = [
+            {k: v for k, v in doc.items() if k != '_id'}
+            for doc in self.documents
+            if self._matches(doc, query)
+        ]
+
+        class _Cursor:
+            def __init__(self, docs):
+                self.docs = docs
+
+            async def to_list(self, length):
+                return self.docs[:length]
+
+            def skip(self, n):
+                self.docs = self.docs[n:]
+                return self
+
+            def limit(self, n):
+                self.docs = self.docs[:n]
+                return self
+
+        return _Cursor(matches)
+
     async def insert_one(self, document, session=None):
         self.documents.append(dict(document))
         return FakeInsertResult(document.get('id'))
@@ -206,6 +230,69 @@ async def test_subscription_enforcement_blocks_access(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_single_shop_user_gets_shop_ids_fallback(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        'db',
+        FakeDB(
+            users=[{'id': 'owner-1', 'phone': '0700', 'name': 'Owner', 'shop_id': 'shop-1', 'created_at': 'now'}],
+            subscriptions=[{'id': 'sub-1', 'shop_id': 'shop-1', 'status': 'active', 'expires_at': '2999-01-01T00:00:00+00:00'}],
+        ),
+    )
+
+    token = server.create_token('owner-1', 'shop-1', 'owner')
+    user = await server.get_current_user(
+        request=SimpleNamespace(url=SimpleNamespace(path='/api/products'), headers={}),
+        credentials=HTTPAuthorizationCredentials(scheme='Bearer', credentials=token),
+    )
+
+    assert user['shop_id'] == 'shop-1'
+    assert user['shop_ids'] == ['shop-1']
+
+
+@pytest.mark.asyncio
+async def test_invalid_x_shop_id_is_rejected(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        'db',
+        FakeDB(
+            users=[{'id': 'owner-1', 'phone': '0700', 'name': 'Owner', 'shop_ids': ['shop-1'], 'shop_id': 'shop-1', 'created_at': 'now'}],
+            subscriptions=[{'id': 'sub-1', 'shop_id': 'shop-1', 'status': 'active', 'expires_at': '2999-01-01T00:00:00+00:00'}],
+        ),
+    )
+
+    token = server.create_token('owner-1', 'shop-1', 'owner')
+    with pytest.raises(HTTPException) as exc:
+        await server.get_current_user(
+            request=SimpleNamespace(url=SimpleNamespace(path='/api/products'), headers={}),
+            credentials=HTTPAuthorizationCredentials(scheme='Bearer', credentials=token),
+            x_shop_id='shop-2',
+        )
+
+    assert exc.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_list_my_shops_returns_assigned_shops(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        'db',
+        FakeDB(
+            shops=[
+                {'id': 'shop-1', 'name': 'Shop One', 'category': 'Retail'},
+                {'id': 'shop-2', 'name': 'Shop Two', 'category': 'Wholesale'},
+            ],
+        ),
+    )
+
+    user = {'id': 'owner-1', 'role': 'owner', 'shop_id': 'shop-1', 'shop_ids': ['shop-1', 'shop-2']}
+    shops = await server.list_my_shops(user=user)
+
+    assert len(shops) == 2
+    assert {shop['id'] for shop in shops} == {'shop-1', 'shop-2'}
+
+
+@pytest.mark.asyncio
 async def test_checkout_creates_order_items_and_updates_stock(monkeypatch):
     fake_db = FakeDB(
         products=[{'id': 'prod-1', 'shop_id': 'shop-1', 'name': 'Product', 'unit_price': 100.0, 'stock_quantity': 5}],
@@ -223,7 +310,9 @@ async def test_checkout_creates_order_items_and_updates_stock(monkeypatch):
 
     assert order.total_amount == 200.0
     assert fake_db.products.documents[0]['stock_quantity'] == 3
+    assert len(fake_db.orders.documents) == 1
     assert len(fake_db.order_items.documents) == 1
+    assert len(fake_db.payments.documents) == 1
     assert fake_db.payments.documents[0]['status'] == 'successful'
 
 
@@ -266,6 +355,7 @@ async def test_marketplace_delivery_updates_stock_and_payment(monkeypatch):
 
     assert delivered['status'] == 'delivered'
     assert fake_db.products.documents[0]['stock_quantity'] == 6
+    assert len(fake_db.payments.documents) == 1
     assert fake_db.payments.documents[0]['status'] == 'successful'
 
 

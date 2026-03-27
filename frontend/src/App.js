@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { Suspense, lazy, useEffect, useState } from 'react';
 import { BrowserRouter, Routes, Route, Navigate, useLocation, useNavigate } from 'react-router-dom';
 import { Toaster } from './components/ui/sonner';
 import { useAuthStore, useOfflineStore } from './lib/store';
@@ -33,6 +33,7 @@ import PurchasesPage from './pages/PurchasesPage';
 import OrdersPage from './pages/OrdersPage';
 import VendorDashboardPage from './pages/VendorDashboardPage';
 import AdminDashboardPage from './pages/AdminDashboardPage';
+const HomePage = lazy(() => import('./pages/HomePage'));
 
 // Protected Route Component
 const ProtectedRoute = ({ children }) => {
@@ -213,6 +214,14 @@ function App() {
         <Routes>
           {/* Public Route */}
           <Route path="/" element={<LoginPage />} />
+          <Route
+            path="/marketplace"
+            element={(
+              <Suspense fallback={<div className="min-h-screen bg-slate-50 p-4">Loading marketplace...</div>}>
+                <HomePage />
+              </Suspense>
+            )}
+          />
           
           {/* Protected Routes */}
           <Route 
