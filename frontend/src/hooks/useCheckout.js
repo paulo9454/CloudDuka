@@ -33,7 +33,7 @@ export default function useCheckout() {
     };
   }, []);
 
-  const checkout = async () => {
+  const checkout = async (paymentMethod = 'paystack') => {
     if (inFlightKeyRef.current) {
       return result;
     }
@@ -52,7 +52,7 @@ export default function useCheckout() {
     setError('');
 
     try {
-      const response = await checkoutRequest({ idempotencyKey });
+      const response = await checkoutRequest({ idempotencyKey, paymentMethod });
       setResult(response);
       sessionStorage.removeItem(CHECKOUT_IN_PROGRESS_KEY);
       return response;

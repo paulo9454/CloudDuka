@@ -1,0 +1,88 @@
+name: Seed Realistic CI
+
+on:
+  push:
+    paths:
+      - 'backend/**'
+      - 'seed_realistic.py'
+      - 'tests/test_seed_realistic.py'
+      - '.env.example'
+      - '.github/workflows/seed-realistic-ci.yml'
+  pull_request:
+    paths:
+      - 'backend/**'
+      - 'seed_realistic.py'
+      - 'tests/test_seed_realistic.py'
+      - '.env.example'
+      - '.github/workflows/seed-realistic-ci.yml'
+
+jobs:
+  seed-and-test:
+    runs-on: ubuntu-latest
+    services:
+      mongodb:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ ping: 1 })'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt pytest
+
+      - name: Load CI environment from .env.example
+        run: |
+          set -a
+          source .env.example
+          set +a
+          echo "MONGO_URL=${MONGO_URL}" >> $GITHUB_ENV
+          echo "DB_NAME=cloudduka_ci" >> $GITHUB_ENV
+
+      - name: Wait for MongoDB readiness
+        run: |
+          python - <<'PY'
+          import os
+          import time
+          from pymongo import MongoClient
+
+          mongo_url = os.environ.get("MONGO_URL", "mongodb://localhost:27017")
+          deadline = time.time() + 60
+          while time.time() < deadline:
+              try:
+                  MongoClient(mongo_url, serverSelectionTimeoutMS=1000).admin.command("ping")
+                  print("MongoDB is ready")
+                  break
+              except Exception as exc:
+                  print(f"Waiting for MongoDB: {exc}")
+                  time.sleep(2)
+          else:
+              raise SystemExit("MongoDB did not become ready in time")
+          PY
+
+      - name: Seed deterministic (fresh DB)
+        run: python seed_realistic.py
+
+      - name: Seed deterministic again (idempotence)
+        run: python seed_realistic.py
+
+      - name: Seed with faker expansion
+        run: python seed_realistic.py --faker-expand
+
+      - name: Run seed regression tests
+        run: pytest -q tests/test_seed_realistic.py
