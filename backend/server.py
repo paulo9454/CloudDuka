@@ -24,6 +24,7 @@ from datetime import datetime, timezone, timedelta
 import jwt
 import bcrypt
 from io import BytesIO
+from io import StringIO
 from fpdf import FPDF
 import base64
 import requests
@@ -31,7 +32,9 @@ import time
 import hmac
 import hashlib
 import json
+import csv
 import re
+from math import radians, sin, cos, sqrt, atan2
 from bson import ObjectId
 from backend.seed_realistic import seed_realistic_async
 
@@ -410,6 +413,7 @@ class SupplierResponse(BaseModel):
     name: str
     phone: str
     notes: Optional[str] = None
+    reliability_score: Optional[float] = None
     shop_id: str
     created_at: str
 
@@ -425,9 +429,11 @@ class PurchaseItem(BaseModel):
 
 
 class PurchaseCreate(BaseModel):
-    supplier_id: str
-    items: List[PurchaseItem]
-    total_cost: float
+    supplier_id: Optional[str] = None
+    items: List[PurchaseItem] = Field(default_factory=list)
+    total_cost: float = 0.0
+    product_ids: List[str] = Field(default_factory=list)
+    use_auto_suggestions: bool = False
     notes: Optional[str] = None
 
 
@@ -439,6 +445,7 @@ class PurchaseResponse(BaseModel):
     supplier_name: str
     items: List[PurchaseItem]
     total_cost: float
+    estimated_arrival_days: Optional[int] = None
     notes: Optional[str] = None
     shop_id: str
     created_by: str
@@ -479,6 +486,17 @@ class PublicProductResponse(BaseModel):
     image_url: Optional[str] = None
     description: Optional[str] = None
     availability: str
+
+
+class SocialOrderLineItem(BaseModel):
+    product_id: Optional[str] = None
+    quantity: int = Field(default=1, gt=0)
+
+
+class WhatsAppOrderIngestionRequest(BaseModel):
+    phone_number: str
+    product_ids: List[SocialOrderLineItem] = Field(default_factory=list)
+    metadata: Optional[dict] = None
 
 
 class MarketplaceOrderItem(BaseModel):
@@ -565,6 +583,10 @@ class OrderStatusPatch(BaseModel):
 
 class OrderLifecycleStatusPatch(BaseModel):
     status: Literal["pending", "paid", "processing", "ready", "delivered", "cancelled"]
+
+
+class RiderOrderStatusPatch(BaseModel):
+    status: Literal["on_delivery", "completed"]
 
 # =============================================================================
 # HELPER FUNCTIONS
@@ -810,6 +832,12 @@ def require_customer(user: dict = Depends(get_current_user)):
     return user
 
 
+def require_rider(user: dict = Depends(get_current_user)):
+    if user.get("role") != "rider":
+        raise HTTPException(status_code=403, detail="Rider access required")
+    return user
+
+
 
 def require_shopkeeper(user: dict = Depends(get_current_user)):
     if user.get("role") != "shopkeeper":
@@ -924,6 +952,472 @@ def normalize_limit_offset(limit: Optional[int], offset: int, default_limit: int
     return max(1, min(limit, max_limit)), safe_offset
 
 
+def resolve_period_range(period: str) -> tuple[str, str]:
+    now = datetime.now(timezone.utc)
+    normalized = (period or "today").strip().lower()
+    if normalized == "today":
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif normalized == "week":
+        start = (now - timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0)
+    elif normalized == "month":
+        start = (now - timedelta(days=30)).replace(hour=0, minute=0, second=0, microsecond=0)
+    else:
+        raise HTTPException(status_code=400, detail="Invalid period. Use today, week, or month")
+    return start.isoformat(), now.isoformat()
+
+
+FORECAST_OBSERVABILITY = {
+    "forecast_requests": 0,
+    "stockout_predictions": 0,
+    "restock_accuracy": None,  # reserved for future calibration pipeline
+}
+AUTO_PURCHASE_OBSERVABILITY = {
+    "auto_purchase_requests": 0,
+    "recommended_purchase_accuracy": None,  # reserved for future calibration pipeline
+    "supplier_rank_usage": 0,
+}
+SOCIAL_COMMERCE_OBSERVABILITY = {
+    "social_product_feed_requests": 0,
+    "social_order_ingestions": 0,
+    "webhook_event_errors": 0,
+    "external_checkout_redirects": 0,
+}
+_DAILY_SALES_CACHE: Dict[str, dict] = {}
+
+
+async def get_product_daily_sales(shop_id: str, product_id: str, lookback_days: int = 14) -> List[float]:
+    days = max(lookback_days, 1)
+    cache_key = f"{shop_id}:{product_id}:{days}"
+    now = datetime.now(timezone.utc)
+    cached = _DAILY_SALES_CACHE.get(cache_key)
+    if cached and (now - cached["computed_at"]).total_seconds() < 300:
+        return list(cached["series"])
+
+    start = (now - timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    pipeline = [
+        {"$match": {"shop_id": shop_id, "product_id": product_id, "created_at": {"$gte": start}}},
+        {"$project": {"day": {"$substr": ["$created_at", 0, 10]}, "quantity": 1}},
+        {"$group": {"_id": "$day", "units": {"$sum": "$quantity"}}},
+        {"$sort": {"_id": 1}},
+    ]
+    rows = await db.order_items.aggregate(pipeline).to_list(days + 5)
+    by_day = {row.get("_id"): float(row.get("units", 0) or 0) for row in rows}
+
+    series: List[float] = []
+    for i in range(days):
+        day = (now - timedelta(days=days - 1 - i)).strftime("%Y-%m-%d")
+        series.append(float(by_day.get(day, 0.0)))
+
+    _DAILY_SALES_CACHE[cache_key] = {"computed_at": now, "series": series}
+    return series
+
+
+async def forecast_demand(product_id: str, shop_id: str, days: int = 7) -> dict:
+    FORECAST_OBSERVABILITY["forecast_requests"] += 1
+    forecast_days = max(days, 1)
+    series = await get_product_daily_sales(shop_id, product_id, lookback_days=14)
+    if not series:
+        series = [0.0]
+    avg_daily_sales = float(sum(series) / len(series)) if series else 0.0
+    last_3_avg = float(sum(series[-3:]) / max(len(series[-3:]), 1)) if series else 0.0
+
+    if avg_daily_sales == 0:
+        trend_factor = 1.0
+    elif last_3_avg > avg_daily_sales * 1.05:
+        trend_factor = 1.2
+    elif last_3_avg < avg_daily_sales * 0.95:
+        trend_factor = 0.8
+    else:
+        trend_factor = 1.0
+
+    forecast_value = avg_daily_sales * forecast_days * trend_factor
+    product = await db.products.find_one({"id": product_id, "shop_id": shop_id}, {"_id": 0}) or {}
+    if avg_daily_sales <= 0:
+        # New/unsold products fallback to velocity signal.
+        fallback_velocity = float(product.get("sales_velocity", 0.0) or 0.0)
+        if fallback_velocity > 0:
+            avg_daily_sales = fallback_velocity
+            forecast_value = avg_daily_sales * forecast_days
+
+    current_stock = float(product.get("stock_quantity", 0) or 0)
+    days_until_stockout = None if avg_daily_sales <= 0 else round(current_stock / avg_daily_sales, 2)
+    if days_until_stockout is not None:
+        FORECAST_OBSERVABILITY["stockout_predictions"] += 1
+
+    predicted_demand_7d = round(float(forecast_value), 2)
+    await db.products.update_one(
+        {"id": product_id, "shop_id": shop_id},
+        {
+            "$set": {
+                "predicted_demand_7d": predicted_demand_7d,
+                "predicted_stockout_days": days_until_stockout,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        },
+    )
+    return {
+        "product_id": product_id,
+        "last_7_days_sales": series[-7:],
+        "avg_daily_sales": round(avg_daily_sales, 4),
+        "trend_factor": trend_factor,
+        "forecast_7d": predicted_demand_7d,
+        "days_until_stockout": days_until_stockout,
+    }
+
+
+async def compute_inventory_health(shop_id: str) -> dict:
+    products = await db.products.find({"shop_id": shop_id}, {"_id": 0}).to_list(5000)
+    total = max(len(products), 1)
+    low_stock = 0
+    out_of_stock = 0
+    forecast_risk = 0
+    for product in products:
+        stock = float(product.get("stock_quantity", 0) or 0)
+        min_stock = float(product.get("min_stock_level", 0) or 0)
+        if stock <= min_stock:
+            low_stock += 1
+        if stock <= 0:
+            out_of_stock += 1
+        days_until_stockout = product.get("predicted_stockout_days")
+        if isinstance(days_until_stockout, (int, float)) and days_until_stockout < 5:
+            forecast_risk += 1
+
+    low_ratio = low_stock / total
+    out_ratio = out_of_stock / total
+    risk_ratio = forecast_risk / total
+    raw_score = 100 - int((low_ratio * 35 + out_ratio * 45 + risk_ratio * 20) * 100)
+    score = max(0, min(100, raw_score))
+    status = "good" if score >= 75 else ("warning" if score >= 45 else "critical")
+    return {"health_score": score, "status": status}
+
+
+async def compute_sales_velocity(shop_id: str, days: int = 30) -> dict:
+    start = (datetime.now(timezone.utc) - timedelta(days=max(days, 1))).isoformat()
+    pipeline = [
+        {"$match": {"shop_id": shop_id, "created_at": {"$gte": start}}},
+        {
+            "$group": {
+                "_id": "$product_id",
+                "units_sold": {"$sum": "$quantity"},
+            }
+        },
+    ]
+    order_item_stats = await db.order_items.aggregate(pipeline).to_list(5000)
+    velocity_by_product = {}
+    for row in order_item_stats:
+        product_id = row.get("_id")
+        units = float(row.get("units_sold", 0) or 0)
+        velocity = round(units / max(days, 1), 4)
+        velocity_by_product[product_id] = velocity
+        await db.products.update_one(
+            {"id": product_id, "shop_id": shop_id},
+            {"$set": {"sales_velocity": velocity, "updated_at": datetime.now(timezone.utc).isoformat()}},
+        )
+    return velocity_by_product
+
+
+def _safe_int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _build_po_reference(shop_id: str, supplier_id: str, product_ids: List[str], now: datetime) -> str:
+    key = f"{shop_id}:{supplier_id}:{','.join(sorted(product_ids))}:{now.strftime('%Y%m%d')}"
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:8].upper()
+    return f"PO-AUTO-{now.strftime('%Y%m%d')}-{digest}"
+
+
+def _calc_supplier_reliability(stats: dict) -> float:
+    avg_arrival = _safe_float(stats.get("avg_arrival_days"), 7.0)
+    avg_fulfillment = _safe_float(stats.get("avg_fulfillment_rate"), 1.0)
+    if avg_arrival <= 2:
+        speed_score = 1.0
+    elif avg_arrival <= 5:
+        speed_score = 0.8
+    elif avg_arrival <= 8:
+        speed_score = 0.6
+    else:
+        speed_score = 0.4
+    reliability = (avg_fulfillment * 0.7) + (speed_score * 0.3)
+    return round(max(0.0, min(1.0, reliability)), 4)
+
+
+async def _supplier_rankings(shop_id: str) -> List[dict]:
+    suppliers = await db.suppliers.find({"shop_id": shop_id}, {"_id": 0}).to_list(2000)
+    purchases = await db.purchases.find({"shop_id": shop_id}, {"_id": 0}).to_list(10000)
+
+    perf: Dict[str, dict] = {}
+    for supplier in suppliers:
+        perf[supplier["id"]] = {
+            "supplier_id": supplier["id"],
+            "name": supplier.get("name"),
+            "lead_time_days": max(1, _safe_int(supplier.get("lead_time_days"), 3)),
+            "purchase_count": 0,
+            "total_spend": 0.0,
+            "total_units_ordered": 0,
+            "total_units_received": 0,
+            "total_arrival_days": 0.0,
+            "arrival_samples": 0,
+            "reliability_score": _safe_float(supplier.get("reliability_score"), 0.0),
+            "cost_efficiency": 0.0,
+            "average_fulfillment_rate": 1.0,
+        }
+
+    for purchase in purchases:
+        sid = purchase.get("supplier_id")
+        if sid not in perf:
+            continue
+        row = perf[sid]
+        row["purchase_count"] += 1
+        row["total_spend"] += _safe_float(purchase.get("total_cost"), 0.0)
+
+        ordered_units = 0
+        received_units = 0
+        for item in purchase.get("items", []):
+            qty = max(0, _safe_int(item.get("quantity"), 0))
+            upp = max(1, _safe_int(item.get("units_per_package"), 1))
+            ordered_units += qty * upp
+            received_units += max(0, _safe_int(item.get("received_quantity"), qty)) * upp
+        row["total_units_ordered"] += ordered_units
+        row["total_units_received"] += min(received_units, ordered_units) if ordered_units > 0 else 0
+        arrival_days = _safe_float(
+            purchase.get("estimated_arrival_days", purchase.get("actual_arrival_days", row["lead_time_days"])),
+            row["lead_time_days"],
+        )
+        row["total_arrival_days"] += max(1.0, arrival_days)
+        row["arrival_samples"] += 1
+
+    ranked = []
+    for row in perf.values():
+        ordered = max(row["total_units_ordered"], 1)
+        arrival_samples = max(row["arrival_samples"], 1)
+        avg_arrival = row["total_arrival_days"] / arrival_samples
+        avg_fulfillment = row["total_units_received"] / ordered
+        avg_cost_per_unit = row["total_spend"] / ordered if ordered > 0 else 0.0
+        row["average_fulfillment_rate"] = round(avg_fulfillment, 4)
+        row["avg_arrival_days"] = round(avg_arrival, 2)
+        row["avg_cost_per_unit"] = round(avg_cost_per_unit, 4)
+        row["cost_efficiency"] = round(1 / max(avg_cost_per_unit, 0.01), 4)
+        computed_reliability = _calc_supplier_reliability(row)
+        row["reliability_score"] = computed_reliability
+        await db.suppliers.update_one(
+            {"id": row["supplier_id"], "shop_id": shop_id},
+            {"$set": {"reliability_score": computed_reliability, "updated_at": datetime.now(timezone.utc).isoformat()}},
+        )
+        ranked.append(row)
+
+    ranked.sort(
+        key=lambda s: (
+            -_safe_float(s.get("reliability_score"), 0.0),
+            -_safe_float(s.get("average_fulfillment_rate"), 0.0),
+            -_safe_float(s.get("cost_efficiency"), 0.0),
+            _safe_int(s.get("lead_time_days"), 99),
+            -_safe_int(s.get("purchase_count"), 0),
+        )
+    )
+    return ranked
+
+
+async def _compute_auto_purchase_suggestions(shop_id: str, days: int = 7) -> List[dict]:
+    AUTO_PURCHASE_OBSERVABILITY["auto_purchase_requests"] += 1
+    shop = await db.shops.find_one({"id": shop_id}, {"_id": 0}) or {}
+    subscription = normalize_shop_subscription(shop)
+    demand_multiplier = 1.15 if subscription.get("plan") == "online" else 1.0
+    products = await db.products.find({"shop_id": shop_id}, {"_id": 0}).to_list(5000)
+    rankings = await _supplier_rankings(shop_id)
+    velocity_by_product = await compute_sales_velocity(shop_id, days=max(days, 1))
+    suggestions: List[dict] = []
+    for product in products:
+        product_id = product.get("id")
+        stock = max(0, _safe_int(product.get("stock_quantity"), 0))
+        trend = await forecast_demand(product_id=product_id, shop_id=shop_id, days=max(days, 1))
+        predicted_demand = _safe_float(trend.get("forecast_7d"), 0.0)
+        if predicted_demand <= 0:
+            fallback_velocity = _safe_float(
+                velocity_by_product.get(product_id, product.get("sales_velocity", 0.0)),
+                0.0,
+            )
+            predicted_demand = max(0.0, round(fallback_velocity * max(days, 1), 2))
+        predicted_demand = round(predicted_demand * demand_multiplier, 2)
+
+        candidate_suppliers = [s for s in rankings if s.get("purchase_count", 0) > 0]
+        if not candidate_suppliers:
+            candidate_suppliers = rankings
+        if not candidate_suppliers:
+            continue
+        preferred = candidate_suppliers[0]
+        AUTO_PURCHASE_OBSERVABILITY["supplier_rank_usage"] += 1
+        lead_time = max(1, _safe_int(preferred.get("lead_time_days"), 3))
+        reliability = max(0.1, _safe_float(preferred.get("reliability_score"), 0.7))
+        moq = max(1, _safe_int(product.get("moq"), 1))
+        lead_time_buffer = predicted_demand * (lead_time / 7)
+        reliability_buffer = predicted_demand * (1 - min(reliability, 1.0)) * 0.5
+        target_qty = int(round(predicted_demand + lead_time_buffer + reliability_buffer))
+        shortage = max(0, target_qty - stock)
+        if shortage <= 0:
+            continue
+        recommended_qty = int(((max(shortage, moq) + moq - 1) // moq) * moq)
+        est_unit_cost = _safe_float(product.get("cost_price"), 0.0)
+        estimated_cost = round(est_unit_cost * recommended_qty, 2)
+        await db.products.update_one(
+            {"id": product_id, "shop_id": shop_id},
+            {
+                "$set": {
+                    "recommended_purchase_qty": recommended_qty,
+                    "preferred_supplier_id": preferred["supplier_id"],
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            },
+        )
+        suggestions.append(
+            {
+                "product_id": product_id,
+                "name": product.get("name"),
+                "current_stock": stock,
+                "predicted_demand_7d": round(predicted_demand, 2),
+                "recommended_quantity": recommended_qty,
+                "preferred_supplier_id": preferred["supplier_id"],
+                "estimated_arrival_days": lead_time,
+                "estimated_cost": estimated_cost,
+                "lead_time_days": lead_time,
+                "supplier_reliability_score": reliability,
+            }
+        )
+    return suggestions
+
+
+def _shop_slug(shop: dict) -> str:
+    source = (shop or {}).get("slug") or (shop or {}).get("name") or (shop or {}).get("id") or "shop"
+    slug = re.sub(r"[^a-z0-9]+", "-", str(source).strip().lower()).strip("-")
+    return slug or "shop"
+
+
+def _build_social_product_feed_item(product: dict, shop_slug: str) -> dict:
+    stock = _safe_int(product.get("stock_quantity"), 0)
+    return {
+        "product_id": product.get("id"),
+        "title": product.get("name"),
+        "description": product.get("description") or "",
+        "price": _safe_float(product.get("unit_price"), 0.0),
+        "availability": "in_stock" if stock > 0 else "out_of_stock",
+        "image_url": product.get("image_url") or "",
+        "product_url": f"/public/storefront/{shop_slug}/product/{product.get('id')}",
+        "category": product.get("category") or "General",
+        "brand": product.get("brand") or (product.get("shop_name") or "CloudDuka"),
+        # Optional platform fields (left additive for future connectors)
+        "gtin": product.get("gtin"),
+        "ean": product.get("ean"),
+        "upc": product.get("upc"),
+        "sale_price": product.get("sale_price"),
+        "additional_images": product.get("additional_images") or [],
+    }
+
+
+async def _ingest_social_order(
+    *,
+    shop_id: str,
+    channel: str,
+    phone_number: str,
+    line_items: List[dict],
+    metadata: Optional[dict] = None,
+) -> dict:
+    SOCIAL_COMMERCE_OBSERVABILITY["social_order_ingestions"] += 1
+    clean_items = []
+    unknown_items = []
+    for row in line_items or []:
+        product_id = str(row.get("product_id") or "").strip()
+        quantity = max(1, _safe_int(row.get("quantity"), 1))
+        if not product_id:
+            unknown_items.append(row)
+            continue
+        product = await db.products.find_one({"id": product_id, "shop_id": shop_id}, {"_id": 0})
+        if not product:
+            unknown_items.append(row)
+            continue
+        clean_items.append({"product_id": product_id, "quantity": quantity})
+
+    if not clean_items:
+        SOCIAL_COMMERCE_OBSERVABILITY["webhook_event_errors"] += 1
+        raise HTTPException(status_code=400, detail="No valid products found in social order payload")
+
+    shop = await db.shops.find_one({"id": shop_id}, {"_id": 0}) or {}
+    check_shop_subscription(shop)
+    actor_user_id = shop.get("owner_id")
+    if not actor_user_id:
+        SOCIAL_COMMERCE_OBSERVABILITY["webhook_event_errors"] += 1
+        raise HTTPException(status_code=400, detail="Shop owner not configured")
+
+    cart = await db.cart.find_one({"user_id": actor_user_id, "shop_id": shop_id}, {"_id": 0})
+    cart_id = cart.get("id") if cart else str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    cart_items = [
+        {
+            "id": str(uuid.uuid4()),
+            "product_id": item["product_id"],
+            "quantity": item["quantity"],
+            "created_at": now,
+        }
+        for item in clean_items
+    ]
+    await db.cart.update_one(
+        {"id": cart_id},
+        {
+            "$set": {
+                "id": cart_id,
+                "user_id": actor_user_id,
+                "shop_id": shop_id,
+                "items": cart_items,
+                "updated_at": now,
+            }
+        },
+        upsert=True,
+    )
+
+    requested_method = validate_checkout_payment_method((metadata or {}).get("payment_method"))
+    checkout = await checkout_cart(
+        CheckoutRequest(
+            payment_method=requested_method,
+            customer_name=(metadata or {}).get("customer_name"),
+            customer_id=(metadata or {}).get("customer_id"),
+        ),
+        {"id": actor_user_id, "shop_id": shop_id},
+    )
+    await db.orders.update_one(
+        {"id": checkout.id, "shop_id": shop_id},
+        {
+            "$set": {
+                "source": f"social_{channel}",
+                "social_channel": channel,
+                "social_phone_number": phone_number,
+                "social_metadata": metadata or {},
+            }
+        },
+    )
+
+    payment_link = None
+    if requested_method in {"paystack", "mpesa"}:
+        SOCIAL_COMMERCE_OBSERVABILITY["external_checkout_redirects"] += 1
+        payment_link = f"/api/orders/{checkout.id}/pay"
+
+    return {
+        "order_id": checkout.id,
+        "status": checkout.status,
+        "payment_method": checkout.payment_method,
+        "payment_status": checkout.payment_status,
+        "payment_link": payment_link,
+        "unknown_items": unknown_items,
+    }
+
+
 def safe_regex(value: str, *, max_len: int = 80) -> str:
     text = (value or "").strip()
     if not text:
@@ -976,6 +1470,28 @@ VALID_ORDER_TRANSITIONS = {
 
 def get_order_lifecycle_status(order: dict) -> str:
     return (order.get("lifecycle_status") or order.get("status") or "pending").lower()
+
+
+def distance_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    earth_radius_km = 6371.0
+    dlat = radians(lat2 - lat1)
+    dlng = radians(lng2 - lng1)
+    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlng / 2) ** 2
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+    return earth_radius_km * c
+
+
+VALID_CHECKOUT_PAYMENT_METHODS = {"cash", "mpesa", "credit", "paystack"}
+
+
+def validate_checkout_payment_method(payment_method: Optional[str]) -> str:
+    normalized = (payment_method or "").strip().lower()
+    if normalized not in VALID_CHECKOUT_PAYMENT_METHODS:
+        raise HTTPException(
+            status_code=422,
+            detail="payment_method is required and must be one of: cash, mpesa, credit, paystack",
+        )
+    return normalized
 
 
 def build_status_history_entry(status_value: str):
@@ -1465,6 +1981,31 @@ async def get_product(
 
 # -----------------------------------------------------------------------------
 
+
+@api_router.get("/products/{product_id}/demand-trend")
+async def get_product_demand_trend(
+    product_id: str,
+    days: int = 7,
+    user: dict = Depends(get_current_user),
+):
+    await validate_shop_access(user, user.get("shop_id"))
+    product = await db.products.find_one({"id": product_id, "shop_id": user["shop_id"]}, {"_id": 0})
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+    trend = await forecast_demand(product_id=product_id, shop_id=user["shop_id"], days=max(days, 1))
+    return {
+        "product_id": product_id,
+        "name": product.get("name"),
+        "last_7_days_sales": trend["last_7_days_sales"],
+        "avg_daily_sales": trend["avg_daily_sales"],
+        "trend_factor": trend["trend_factor"],
+        "forecast_7d": trend["forecast_7d"],
+        "days_until_stockout": trend["days_until_stockout"],
+    }
+
+
+# -----------------------------------------------------------------------------
+
 @api_router.put("/products/{product_id}", response_model=ProductResponse)
 async def update_product(
     product_id: str,
@@ -1575,6 +2116,121 @@ async def list_categories_simple(
         ]
 
     return categories
+
+
+@api_router.get("/products/low-stock")
+async def list_low_stock_products(
+    period_days: int = 30,
+    user: dict = Depends(get_current_user),
+):
+    await validate_shop_access(user, user.get("shop_id"))
+    velocity_by_product = await compute_sales_velocity(user["shop_id"], days=max(period_days, 1))
+    products = await db.products.find(
+        {
+            "shop_id": user["shop_id"],
+            "$expr": {"$lte": ["$stock_quantity", "$min_stock_level"]},
+        },
+        {"_id": 0},
+    ).to_list(5000)
+    fast_threshold = 1.0
+    slow_threshold = 0.1
+    for product in products:
+        velocity = float(velocity_by_product.get(product.get("id"), product.get("sales_velocity", 0.0)) or 0.0)
+        product["sales_velocity"] = velocity
+        product["movement"] = "fast_moving" if velocity >= fast_threshold else ("slow_moving" if velocity <= slow_threshold else "steady")
+    return {"count": len(products), "products": products}
+
+
+@api_router.get("/products/out-of-stock")
+async def list_out_of_stock_products(
+    period_days: int = 30,
+    user: dict = Depends(get_current_user),
+):
+    await validate_shop_access(user, user.get("shop_id"))
+    velocity_by_product = await compute_sales_velocity(user["shop_id"], days=max(period_days, 1))
+    products = await db.products.find(
+        {"shop_id": user["shop_id"], "stock_quantity": {"$lte": 0}},
+        {"_id": 0},
+    ).to_list(5000)
+    for product in products:
+        product["sales_velocity"] = float(velocity_by_product.get(product.get("id"), product.get("sales_velocity", 0.0)) or 0.0)
+    return {"count": len(products), "products": products}
+
+
+@api_router.get("/inventory/restock-suggestions")
+async def restock_suggestions(
+    period_days: int = 30,
+    user: dict = Depends(get_current_user),
+):
+    await validate_shop_access(user, user.get("shop_id"))
+    velocity_by_product = await compute_sales_velocity(user["shop_id"], days=max(period_days, 1))
+    products = await db.products.find({"shop_id": user["shop_id"]}, {"_id": 0}).to_list(5000)
+    suggestions = []
+    for product in products:
+        min_stock = int(product.get("min_stock_level", 0) or 0)
+        stock = int(product.get("stock_quantity", 0) or 0)
+        velocity = float(velocity_by_product.get(product.get("id"), product.get("sales_velocity", 0.0)) or 0.0)
+        low_stock_needed = stock <= min_stock
+        high_demand = velocity >= 1.0
+        if not low_stock_needed and not high_demand:
+            continue
+        recommended_quantity = max(min_stock - stock, int(round(velocity * 14)))
+        if recommended_quantity <= 0:
+            continue
+        reason = "high_demand" if high_demand and not low_stock_needed else ("low_stock" if low_stock_needed and not high_demand else "low_stock,high_demand")
+        suggestions.append(
+            {
+                "product_id": product.get("id"),
+                "recommended_quantity": max(int(round(velocity * 7)) - stock, 0),
+                "reason": reason,
+                "sales_velocity": velocity,
+                "predicted_demand_7d": round(float(velocity * 7), 2),
+                "current_stock": stock,
+            }
+        )
+    return {"count": len(suggestions), "suggestions": suggestions}
+
+
+@api_router.get("/inventory/forecast")
+async def inventory_forecast(
+    days: int = 7,
+    user: dict = Depends(get_current_user),
+):
+    await validate_shop_access(user, user.get("shop_id"))
+    products = await db.products.find({"shop_id": user["shop_id"]}, {"_id": 0}).to_list(5000)
+    forecasts = []
+    for product in products:
+        trend = await forecast_demand(product_id=product["id"], shop_id=user["shop_id"], days=max(days, 1))
+        days_until_stockout = trend.get("days_until_stockout")
+        if days_until_stockout is None:
+            status = "safe"
+        elif days_until_stockout < 2:
+            status = "critical"
+        elif days_until_stockout < 5:
+            status = "warning"
+        else:
+            status = "safe"
+        forecasts.append(
+            {
+                "product_id": product.get("id"),
+                "name": product.get("name"),
+                "current_stock": int(product.get("stock_quantity", 0) or 0),
+                "predicted_demand_7d": trend.get("forecast_7d", 0.0),
+                "days_until_stockout": days_until_stockout,
+                "status": status,
+            }
+        )
+    return forecasts
+
+
+@api_router.get("/inventory/forecast/alerts")
+async def inventory_forecast_alerts(
+    days: int = 7,
+    user: dict = Depends(get_current_user),
+):
+    forecasts = await inventory_forecast(days=days, user=user)
+    alerts = [row for row in forecasts if row.get("status") in {"critical", "warning"}]
+    return {"count": len(alerts), "alerts": alerts}
 # =============================================================================
 # SALES ROUTES
 # =============================================================================
@@ -2337,6 +2993,95 @@ async def get_dashboard_stats(user: dict = Depends(get_current_user)):
     }
 
 
+@api_router.get("/reports/top-products")
+async def get_top_products_insight(
+    period: str = "today",
+    limit: int = 10,
+    user: dict = Depends(get_current_user),
+):
+    start_iso, end_iso = resolve_period_range(period)
+    safe_limit = max(1, min(limit, 50))
+    pipeline = [
+        {
+            "$match": {
+                "shop_id": user["shop_id"],
+                "created_at": {"$gte": start_iso, "$lte": end_iso},
+            }
+        },
+        {
+            "$group": {
+                "_id": "$product_id",
+                "product_name": {"$first": "$product_name"},
+                "units_sold": {"$sum": "$quantity"},
+                "revenue": {"$sum": "$total"},
+            }
+        },
+        {"$sort": {"units_sold": -1, "revenue": -1}},
+        {"$limit": safe_limit},
+    ]
+    items = await db.order_items.aggregate(pipeline).to_list(safe_limit)
+    return {"period": period, "top_products": items}
+
+
+@api_router.get("/reports/sales-trends")
+async def get_sales_trends(
+    period: str = "week",
+    user: dict = Depends(get_current_user),
+):
+    start_iso, end_iso = resolve_period_range(period)
+    sales_match = {
+        "shop_id": user["shop_id"],
+        "created_at": {"$gte": start_iso, "$lte": end_iso},
+    }
+    by_hour_pipeline = [
+        {"$match": sales_match},
+        {"$project": {"hour": {"$substr": ["$created_at", 11, 2]}, "total_amount": 1}},
+        {"$group": {"_id": "$hour", "total_sales": {"$sum": "$total_amount"}, "total_orders": {"$sum": 1}}},
+        {"$sort": {"_id": 1}},
+    ]
+    by_day_pipeline = [
+        {"$match": sales_match},
+        {"$project": {"day": {"$substr": ["$created_at", 0, 10]}, "total_amount": 1}},
+        {"$group": {"_id": "$day", "total_sales": {"$sum": "$total_amount"}, "total_orders": {"$sum": 1}}},
+        {"$sort": {"_id": 1}},
+    ]
+    sales_by_hour = await db.sales.aggregate(by_hour_pipeline).to_list(48)
+    sales_by_day = await db.sales.aggregate(by_day_pipeline).to_list(90)
+    return {"period": period, "sales_by_hour": sales_by_hour, "sales_by_day": sales_by_day}
+
+
+@api_router.get("/reports/insights")
+async def get_report_insights(
+    period: str = "today",
+    user: dict = Depends(get_current_user),
+):
+    start_iso, end_iso = resolve_period_range(period)
+    sales_pipeline = [
+        {
+            "$match": {
+                "shop_id": user["shop_id"],
+                "created_at": {"$gte": start_iso, "$lte": end_iso},
+            }
+        },
+        {"$group": {"_id": None, "total_sales": {"$sum": "$total_amount"}, "total_orders": {"$sum": 1}}},
+    ]
+    totals = await db.sales.aggregate(sales_pipeline).to_list(1)
+    sales_totals = totals[0] if totals else {"total_sales": 0.0, "total_orders": 0}
+    top_products = await get_top_products_insight(period=period, limit=5, user=user)
+    trends = await get_sales_trends(period=period, user=user)
+    total_sales = float(sales_totals.get("total_sales", 0.0) or 0.0)
+    total_orders = int(sales_totals.get("total_orders", 0) or 0)
+    return {
+        "period": period,
+        "total_sales": total_sales,
+        "total_orders": total_orders,
+        "average_order_value": (total_sales / total_orders) if total_orders else 0.0,
+        "top_products": top_products.get("top_products", []),
+        "sales_by_hour": trends.get("sales_by_hour", []),
+        "sales_by_day": trends.get("sales_by_day", []),
+    }
+
+
 @api_router.get("/dashboard/vendor")
 async def get_vendor_dashboard_compat(user: dict = Depends(get_current_user)):
     """Backward-compatible alias used by legacy frontend dashboards."""
@@ -2362,6 +3107,42 @@ async def get_payment_providers_compare(user: dict = Depends(get_current_user)):
         by_method[method] = by_method.get(method, 0.0) + amount
         by_status[status] = by_status.get(status, 0) + 1
     return {"by_method": by_method, "by_status": by_status, "count": len(payments)}
+
+
+@api_router.get("/dashboard/summary")
+async def get_dashboard_summary(user: dict = Depends(get_current_user)):
+    start_iso, end_iso = resolve_period_range("today")
+    sales = await db.sales.find(
+        {"shop_id": user["shop_id"], "created_at": {"$gte": start_iso, "$lte": end_iso}},
+        {"_id": 0},
+    ).to_list(5000)
+    orders_today = await db.orders.count_documents({"shop_id": user["shop_id"], "created_at": {"$gte": start_iso, "$lte": end_iso}})
+    low_stock_count = await db.products.count_documents(
+        {"shop_id": user["shop_id"], "$expr": {"$lte": ["$stock_quantity", "$min_stock_level"]}}
+    )
+    forecast_rows = await inventory_forecast(days=7, user=user)
+    predicted_stockouts = [row for row in forecast_rows if row.get("days_until_stockout") is not None and row.get("days_until_stockout") < 5]
+    critical_stock_count = len([row for row in forecast_rows if row.get("status") == "critical"])
+    purchase_need_rows = await _compute_auto_purchase_suggestions(user["shop_id"], days=7)
+    estimated_spend = round(sum(_safe_float(row.get("estimated_cost"), 0.0) for row in purchase_need_rows), 2)
+    inventory_health = await compute_inventory_health(user["shop_id"])
+    top_product_data = await get_top_products_insight(period="today", limit=1, user=user)
+    top_product = (top_product_data.get("top_products") or [{}])[0]
+    return {
+        "sales_today": float(sum(float(s.get("total_amount", 0.0) or 0.0) for s in sales)),
+        "orders_today": int(orders_today),
+        "low_stock_count": int(low_stock_count),
+        "top_product": top_product,
+        "inventory_health_score": inventory_health.get("health_score", 0),
+        "inventory_health_status": inventory_health.get("status", "warning"),
+        "critical_stock_count": critical_stock_count,
+        "predicted_stockouts": predicted_stockouts,
+        "predicted_purchase_needs": purchase_need_rows,
+        "estimated_restock_spend": estimated_spend,
+        "forecast_observability": FORECAST_OBSERVABILITY,
+        "auto_purchase_observability": AUTO_PURCHASE_OBSERVABILITY,
+        "social_commerce_observability": SOCIAL_COMMERCE_OBSERVABILITY,
+    }
 
 
 @api_router.get("/reports/sales")
@@ -2698,6 +3479,30 @@ async def delete_supplier(supplier_id: str, user: dict = Depends(require_owner))
     return {"message": "Supplier deleted"}
 
 
+@api_router.get("/suppliers/recommended")
+async def recommended_suppliers(
+    limit: int = 5,
+    user: dict = Depends(get_current_user),
+):
+    safe_limit = max(1, min(limit, 20))
+    ranked = await _supplier_rankings(user["shop_id"])
+    recommended = [
+        {
+            "supplier_id": row.get("supplier_id"),
+            "name": row.get("name"),
+            "purchase_count": int(row.get("purchase_count", 0) or 0),
+            "average_fulfillment_rate": float(row.get("average_fulfillment_rate", 1.0) or 1.0),
+            "reliability_score": float(row.get("reliability_score", 0.0) or 0.0),
+            "cost_efficiency": float(row.get("cost_efficiency", 0.0) or 0.0),
+            "avg_arrival_days": float(row.get("avg_arrival_days", row.get("lead_time_days", 3)) or 3.0),
+            "lead_time_days": int(row.get("lead_time_days", 3) or 3),
+            "total_spend": round(float(row.get("total_spend", 0.0) or 0.0), 2),
+        }
+        for row in ranked[:safe_limit]
+    ]
+    return {"recommended": recommended}
+
+
 # =============================================================================
 # PURCHASE ROUTES
 # =============================================================================
@@ -2706,18 +3511,134 @@ async def delete_supplier(supplier_id: str, user: dict = Depends(require_owner))
 @api_router.post("/purchases", response_model=PurchaseResponse)
 async def create_purchase(data: PurchaseCreate, user: dict = Depends(get_current_user)):
     """Create a purchase order and update stock quantities"""
-    purchase_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
+    shop = await db.shops.find_one({"id": user["shop_id"]}, {"_id": 0}) or {}
+    check_shop_subscription(shop)
 
+    payload_items: List[PurchaseItem] = list(data.items or [])
+    supplier_id = data.supplier_id
+    if data.use_auto_suggestions:
+        suggestions = await _compute_auto_purchase_suggestions(user["shop_id"], days=7)
+        if data.product_ids:
+            wanted_ids = set(data.product_ids)
+            suggestions = [row for row in suggestions if row.get("product_id") in wanted_ids]
+        if not suggestions:
+            raise HTTPException(status_code=400, detail="No auto purchase suggestions available")
+        if not supplier_id:
+            supplier_id = suggestions[0].get("preferred_supplier_id")
+        payload_items = []
+        for row in suggestions:
+            product = await db.products.find_one(
+                {"id": row["product_id"], "shop_id": user["shop_id"]},
+                {"_id": 0},
+            )
+            if not product:
+                continue
+            quantity = max(1, _safe_int(row.get("recommended_quantity"), 1))
+            unit_cost = _safe_float(product.get("cost_price"), 0.0)
+            payload_items.append(
+                PurchaseItem(
+                    product_id=row["product_id"],
+                    product_name=product.get("name", "Unknown Product"),
+                    quantity=quantity,
+                    unit_type="units",
+                    units_per_package=1,
+                    cost=round(quantity * unit_cost, 2),
+                )
+            )
+
+    if not supplier_id:
+        raise HTTPException(status_code=400, detail="supplier_id is required")
+    if not payload_items:
+        raise HTTPException(status_code=400, detail="items are required")
     # Get supplier info
     supplier = await db.suppliers.find_one(
-        {"id": data.supplier_id, "shop_id": user["shop_id"]}, {"_id": 0}
+        {"id": supplier_id, "shop_id": user["shop_id"]}, {"_id": 0}
     )
     if not supplier:
         raise HTTPException(status_code=404, detail="Supplier not found")
+    lead_time_days = max(1, _safe_int(supplier.get("lead_time_days"), 3))
+    deterministic_ref = _build_po_reference(
+        user["shop_id"], supplier_id, [item.product_id for item in payload_items], datetime.now(timezone.utc)
+    )
+    existing_auto_po = await db.purchases.find_one(
+        {"shop_id": user["shop_id"], "purchase_number": deterministic_ref, "is_auto_generated": True},
+        {"_id": 0},
+    )
+    if existing_auto_po:
+        return PurchaseResponse(**existing_auto_po)
+
+    split_purchase_records: List[dict] = []
+    if data.use_auto_suggestions:
+        ranked_suppliers = await _supplier_rankings(user["shop_id"])
+        supplier_by_id = {
+            row["supplier_id"]: await db.suppliers.find_one({"id": row["supplier_id"], "shop_id": user["shop_id"]}, {"_id": 0})
+            for row in ranked_suppliers
+        }
+        remaining_by_product = {item.product_id: item.quantity for item in payload_items}
+        split_allocations: Dict[str, List[PurchaseItem]] = {}
+        for row in ranked_suppliers:
+            sid = row["supplier_id"]
+            supplier_doc = supplier_by_id.get(sid) or {}
+            product_stock = supplier_doc.get("product_stock") or {}
+            allocation: List[PurchaseItem] = []
+            for item in payload_items:
+                remaining_qty = max(0, _safe_int(remaining_by_product.get(item.product_id), 0))
+                if remaining_qty <= 0:
+                    continue
+                available_qty = max(0, _safe_int(product_stock.get(item.product_id), remaining_qty if sid == supplier_id else 0))
+                take_qty = min(remaining_qty, available_qty) if available_qty > 0 else (remaining_qty if sid == supplier_id else 0)
+                if take_qty <= 0:
+                    continue
+                remaining_by_product[item.product_id] = remaining_qty - take_qty
+                unit_cost = _safe_float(item.cost, 0.0) / max(1, item.quantity)
+                allocation.append(
+                    PurchaseItem(
+                        product_id=item.product_id,
+                        product_name=item.product_name,
+                        quantity=take_qty,
+                        unit_type=item.unit_type,
+                        units_per_package=item.units_per_package,
+                        cost=round(unit_cost * take_qty, 2),
+                    )
+                )
+            if allocation:
+                split_allocations[sid] = allocation
+        if split_allocations:
+            payload_items = split_allocations.get(supplier_id, payload_items)
+            for sid, split_items in split_allocations.items():
+                if sid == supplier_id:
+                    continue
+                split_supplier = supplier_by_id.get(sid) or {}
+                split_number = _build_po_reference(
+                    user["shop_id"], sid, [it.product_id for it in split_items], datetime.now(timezone.utc)
+                )
+                exists = await db.purchases.find_one(
+                    {"shop_id": user["shop_id"], "purchase_number": split_number, "is_auto_generated": True},
+                    {"_id": 0},
+                )
+                if exists:
+                    continue
+                split_purchase_records.append(
+                    {
+                        "id": str(uuid.uuid4()),
+                        "purchase_number": split_number,
+                        "supplier_id": sid,
+                        "supplier_name": split_supplier.get("name", sid),
+                        "items": [it.model_dump() for it in split_items],
+                        "total_cost": round(sum(_safe_float(it.cost, 0.0) for it in split_items), 2),
+                        "estimated_arrival_days": max(1, _safe_int(split_supplier.get("lead_time_days"), 3)),
+                        "is_auto_generated": True,
+                        "notes": "Auto-generated split PO for partial supplier stock coverage",
+                        "shop_id": user["shop_id"],
+                        "created_by": user["id"],
+                        "created_at": now,
+                    }
+                )
 
     # Update stock for each item
-    for item in data.items:
+    computed_total_cost = 0.0
+    for item in payload_items:
         product = await db.products.find_one(
             {"id": item.product_id, "shop_id": user["shop_id"]}, {"_id": 0}
         )
@@ -2731,6 +3652,7 @@ async def create_purchase(data: PurchaseCreate, user: dict = Depends(get_current
 
         # Update product stock and cost price
         cost_per_unit = item.cost / total_units if total_units > 0 else 0
+        computed_total_cost += _safe_float(item.cost, 0.0)
         await db.products.update_one(
             {"id": item.product_id, "shop_id": user["shop_id"]},
             {
@@ -2740,12 +3662,14 @@ async def create_purchase(data: PurchaseCreate, user: dict = Depends(get_current
         )
 
     purchase = {
-        "id": purchase_id,
-        "purchase_number": generate_purchase_number(),
-        "supplier_id": data.supplier_id,
+        "id": str(uuid.uuid4()),
+        "purchase_number": deterministic_ref if data.use_auto_suggestions else generate_purchase_number(),
+        "supplier_id": supplier_id,
         "supplier_name": supplier["name"],
-        "items": [item.model_dump() for item in data.items],
-        "total_cost": data.total_cost,
+        "items": [item.model_dump() for item in payload_items],
+        "total_cost": round(_safe_float(data.total_cost, 0.0) or computed_total_cost, 2),
+        "estimated_arrival_days": lead_time_days,
+        "is_auto_generated": bool(data.use_auto_suggestions),
         "notes": data.notes,
         "shop_id": user["shop_id"],
         "created_by": user["id"],
@@ -2753,7 +3677,21 @@ async def create_purchase(data: PurchaseCreate, user: dict = Depends(get_current
     }
 
     await db.purchases.insert_one(purchase)
+    if split_purchase_records:
+        await db.purchases.insert_many(split_purchase_records)
     return PurchaseResponse(**purchase)
+
+
+@api_router.get("/purchases/auto-suggestions")
+async def auto_purchase_suggestions(
+    days: int = 7,
+    user: dict = Depends(get_current_user),
+):
+    await validate_shop_access(user, user.get("shop_id"))
+    shop = await db.shops.find_one({"id": user["shop_id"]}, {"_id": 0}) or {}
+    check_shop_subscription(shop)
+    suggestions = await _compute_auto_purchase_suggestions(user["shop_id"], days=max(days, 1))
+    return suggestions
 
 
 @api_router.get("/purchases", response_model=List[PurchaseResponse])
@@ -2783,7 +3721,42 @@ async def list_purchases(
     return [PurchaseResponse(**p) for p in purchases]
 
 
+@api_router.get("/purchases/stats/summary")
+async def get_purchases_summary(user: dict = Depends(get_current_user)):
+    """Get purchase statistics"""
+    shop_id = user["shop_id"]
+    today = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+
+    today_purchases = await db.purchases.find(
+        {"shop_id": shop_id, "created_at": {"$gte": today.isoformat()}}, {"_id": 0}
+    ).to_list(1000)
+    today_total = sum(float(p.get("total_cost", 0.0) or 0.0) for p in today_purchases)
+    supplier_count = await db.suppliers.count_documents({"shop_id": shop_id})
+    month_start = today.replace(day=1)
+    month_purchases = await db.purchases.find(
+        {"shop_id": shop_id, "created_at": {"$gte": month_start.isoformat()}},
+        {"_id": 0},
+    ).to_list(10000)
+    month_total = sum(float(p.get("total_cost", 0.0) or 0.0) for p in month_purchases)
+    supplier_summary = {}
+    for row in month_purchases:
+        sid = row.get("supplier_id")
+        if not sid:
+            continue
+        supplier_summary[sid] = supplier_summary.get(sid, 0.0) + float(row.get("total_cost", 0.0) or 0.0)
+    return {
+        "today_purchases": len(today_purchases),
+        "today_total": round(today_total, 2),
+        "month_total": round(month_total, 2),
+        "supplier_count": supplier_count,
+        "supplier_spend": supplier_summary,
+    }
+
+
 @api_router.get("/purchases/{purchase_id}", response_model=PurchaseResponse)
+@api_router.get("/purchases/id/{purchase_id}", response_model=PurchaseResponse)
 async def get_purchase(purchase_id: str, user: dict = Depends(get_current_user)):
     purchase = await db.purchases.find_one(
         {"id": purchase_id, "shop_id": user["shop_id"]}, {"_id": 0}
@@ -2812,39 +3785,48 @@ async def delete_purchase(purchase_id: str, user: dict = Depends(require_owner))
     return {"message": "Purchase record deleted"}
 
 
-@api_router.get("/purchases/stats/summary")
-async def get_purchases_summary(user: dict = Depends(get_current_user)):
-    """Get purchase statistics"""
-    shop_id = user["shop_id"]
-    today = datetime.now(timezone.utc).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
+@api_router.get("/purchases/suggestions")
+async def purchase_suggestions(
+    period_days: int = 30,
+    user: dict = Depends(get_current_user),
+):
+    velocity = await compute_sales_velocity(user["shop_id"], days=max(period_days, 1))
+    products = await db.products.find({"shop_id": user["shop_id"]}, {"_id": 0}).to_list(5000)
+    purchase_history = await db.purchases.find({"shop_id": user["shop_id"]}, {"_id": 0}).sort("created_at", -1).to_list(5000)
 
-    # Today's purchases
-    today_purchases = await db.purchases.find(
-        {"shop_id": shop_id, "created_at": {"$gte": today.isoformat()}}, {"_id": 0}
-    ).to_list(1000)
+    product_last_cost = {}
+    product_supplier = {}
+    for purchase in purchase_history:
+        supplier_id = purchase.get("supplier_id")
+        supplier = await db.suppliers.find_one({"id": supplier_id, "shop_id": user["shop_id"]}, {"_id": 0})
+        for item in purchase.get("items", []):
+            product_id = item.get("product_id")
+            if product_id and product_id not in product_last_cost:
+                product_last_cost[product_id] = float(item.get("cost", 0.0) or 0.0)
+                product_supplier[product_id] = supplier.get("name") if supplier else supplier_id
 
-    today_total = sum(p["total_cost"] for p in today_purchases)
+    suggestions = []
+    for product in products:
+        velocity_value = float(velocity.get(product.get("id"), product.get("sales_velocity", 0.0)) or 0.0)
+        min_stock = int(product.get("min_stock_level", 0) or 0)
+        stock = int(product.get("stock_quantity", 0) or 0)
+        if stock > min_stock and velocity_value < 1.0:
+            continue
+        reorder_qty = max(min_stock - stock, int(round(velocity_value * 14)))
+        if reorder_qty <= 0:
+            continue
+        unit_cost = float(product_last_cost.get(product.get("id"), product.get("cost_price", 0.0)) or 0.0)
+        suggestions.append(
+            {
+                "supplier": product_supplier.get(product.get("id"), "Unassigned Supplier"),
+                "product_id": product.get("id"),
+                "product_name": product.get("name"),
+                "recommended_quantity": reorder_qty,
+                "estimated_cost": round(reorder_qty * unit_cost, 2),
+            }
+        )
 
-    # Total suppliers
-    supplier_count = await db.suppliers.count_documents({"shop_id": shop_id})
-
-    # This month's purchases
-    month_start = today.replace(day=1)
-    month_purchases = await db.purchases.find(
-        {"shop_id": shop_id, "created_at": {"$gte": month_start.isoformat()}},
-        {"_id": 0},
-    ).to_list(10000)
-
-    month_total = sum(p["total_cost"] for p in month_purchases)
-
-    return {
-        "today_purchases": len(today_purchases),
-        "today_total": today_total,
-        "month_total": month_total,
-        "supplier_count": supplier_count,
-    }
+    return {"suggestions": suggestions}
 
 
 @api_router.get("/marketplace/vendors")
@@ -2970,6 +3952,83 @@ async def update_shop(data: dict, owner: dict = Depends(require_owner)):
     if shop:
         shop["subscription"] = normalize_shop_subscription(shop)
     return shop
+
+
+@api_router.get("/shops/{shop_id}/product-feed")
+async def shop_product_feed(shop_id: str):
+    shop = await db.shops.find_one({"id": shop_id}, {"_id": 0})
+    if not shop:
+        raise HTTPException(status_code=404, detail="Shop not found")
+
+    products = await db.products.find(
+        {"shop_id": shop_id, "is_active": True},
+        {"_id": 0},
+    ).to_list(10000)
+    return {
+        "shop_id": shop_id,
+        "shop_name": shop.get("name"),
+        "products": [
+            {
+                "id": product.get("id"),
+                "name": product.get("name"),
+                "price": float(product.get("unit_price", 0)),
+                "availability": "in stock" if int(product.get("stock_quantity", 0)) > 0 else "out of stock",
+                "category": product.get("category"),
+                "image_url": product.get("image_url"),
+            }
+            for product in products
+        ],
+    }
+
+
+@api_router.get("/rider/me")
+async def rider_me(rider: dict = Depends(require_rider)):
+    return {
+        "id": rider.get("id"),
+        "name": rider.get("name"),
+        "phone": rider.get("phone"),
+        "status": rider.get("status", "available"),
+        "is_available": rider.get("is_available", True),
+        "current_location": rider.get("current_location"),
+    }
+
+
+@api_router.get("/rider/orders")
+async def rider_orders(
+    limit: Optional[int] = None,
+    offset: int = 0,
+    rider: dict = Depends(require_rider),
+):
+    safe_limit, safe_offset = normalize_limit_offset(limit, offset, default_limit=50, max_limit=200)
+    deliveries = await db.deliveries.find({"rider_id": rider["id"]}, {"_id": 0}).sort("created_at", -1).skip(safe_offset).limit(safe_limit).to_list(safe_limit)
+    return {"data": deliveries, "pagination": {"limit": safe_limit, "offset": safe_offset, "total": len(deliveries)}}
+
+
+@api_router.patch("/rider/orders/{delivery_id}/status")
+async def rider_update_order_status(
+    delivery_id: str,
+    data: RiderOrderStatusPatch,
+    rider: dict = Depends(require_rider),
+):
+    delivery = await db.deliveries.find_one({"id": delivery_id, "rider_id": rider["id"]}, {"_id": 0})
+    if not delivery:
+        raise HTTPException(status_code=404, detail="Delivery not found")
+
+    status_map = {
+        "on_delivery": {"delivery_status": "on_delivery", "rider_status": "on_delivery", "is_available": False},
+        "completed": {"delivery_status": "delivered", "rider_status": "available", "is_available": True},
+    }
+    mapped = status_map[data.status]
+    await db.deliveries.update_one(
+        {"id": delivery_id, "rider_id": rider["id"]},
+        {"$set": {"status": mapped["delivery_status"], "updated_at": datetime.now(timezone.utc).isoformat()}},
+    )
+    await db.users.update_one(
+        {"id": rider["id"]},
+        {"$set": {"status": mapped["rider_status"], "is_available": mapped["is_available"]}},
+    )
+    updated = await db.deliveries.find_one({"id": delivery_id, "rider_id": rider["id"]}, {"_id": 0})
+    return {"delivery": updated, "rider_status": mapped["rider_status"]}
 
 
 def build_customer_cart_item_response(item: dict, product: dict) -> CustomerCartItemResponse:
@@ -3133,6 +4192,7 @@ async def customer_checkout(
     request: Request,
     customer: dict = Depends(require_customer),
 ):
+    data.payment_method = validate_checkout_payment_method(data.payment_method)
     idem_key = request.headers.get("Idempotency-Key")
     idem_state = await begin_checkout_idempotency(customer["id"], idem_key)
     if idem_state.get("state") == "completed":
@@ -3290,6 +4350,67 @@ async def customer_get_order(order_id: str, customer: dict = Depends(require_cus
         {"_id": 0},
     )
     return build_customer_order_response(order, order_items, payment)
+
+
+@api_router.get("/customer/recommendations")
+async def customer_recommendations(customer: dict = Depends(require_customer)):
+    location = customer.get("current_location") or {}
+    if "lat" not in location or "lng" not in location:
+        raise HTTPException(status_code=400, detail="Customer location is required for recommendations")
+
+    recommendation_doc = await db.shop_recommendations.find_one(
+        {"for_customer_id": customer["id"]},
+        {"_id": 0},
+    )
+    ranked = []
+    if recommendation_doc and recommendation_doc.get("nearby_shop_ids"):
+        shops = await db.shops.find(
+            {"id": {"$in": recommendation_doc["nearby_shop_ids"]}, "is_active": True},
+            {"_id": 0},
+        ).to_list(200)
+        index_map = {shop_id: idx for idx, shop_id in enumerate(recommendation_doc["nearby_shop_ids"])}
+        ranked = sorted(shops, key=lambda shop: index_map.get(shop.get("id"), 9999))
+    else:
+        shops = await db.shops.find({"is_active": True}, {"_id": 0}).to_list(500)
+        for shop in shops:
+            shop_loc = shop.get("location") or {}
+            if "lat" not in shop_loc or "lng" not in shop_loc:
+                continue
+            ranked.append(
+                {
+                    **shop,
+                    "_distance_km": distance_km(
+                        float(location["lat"]),
+                        float(location["lng"]),
+                        float(shop_loc["lat"]),
+                        float(shop_loc["lng"]),
+                    ),
+                }
+            )
+        ranked = sorted(ranked, key=lambda item: item.get("_distance_km", 10**6))
+
+    response = []
+    for shop in ranked[:10]:
+        shop_loc = shop.get("location") or {}
+        dist = shop.get("_distance_km")
+        if dist is None and "lat" in shop_loc and "lng" in shop_loc:
+            dist = distance_km(
+                float(location["lat"]),
+                float(location["lng"]),
+                float(shop_loc["lat"]),
+                float(shop_loc["lng"]),
+            )
+        response.append(
+            {
+                "shop_id": shop.get("id"),
+                "shop_name": shop.get("name"),
+                "distance_km": round(float(dist), 3) if dist is not None else None,
+                "location": shop.get("location"),
+            }
+        )
+
+    logger.info("recommendation_served customer_id=%s count=%s", customer["id"], len(response))
+    return {"customer_id": customer["id"], "recommendations": response}
 
 
 
@@ -3470,6 +4591,7 @@ async def checkout_order(
       "items": [{"product_id": "...", "quantity": 2}]
     }
     """
+    data.payment_method = validate_checkout_payment_method(data.payment_method)
     idem_key = request.headers.get("Idempotency-Key")
     idem_state = await begin_checkout_idempotency(user["id"], idem_key)
     if idem_state.get("state") == "completed":
@@ -3638,6 +4760,7 @@ async def cancel_order(order_id: str, user: dict = Depends(get_current_user)):
 async def checkout_cart(data: CheckoutRequest, user: dict):
     # SINGLE SOURCE OF TRUTH:
     # Orders and payments are created ONLY in checkout_cart.
+    payment_method = validate_checkout_payment_method(data.payment_method)
     async def _run_checkout(session=None):
         cart = await db.cart.find_one(
             {"user_id": user["id"], "shop_id": user["shop_id"]}, {"_id": 0}
@@ -3697,12 +4820,12 @@ async def checkout_cart(data: CheckoutRequest, user: dict):
             "total_amount": total_amount,
             "status": "completed",
             "customer_id": data.customer_id,
-            "payment_method": data.payment_method,
+            "payment_method": payment_method,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         await db.orders.insert_one(order, session=session)
 
-        if data.payment_method == "credit":
+        if payment_method == "credit":
             if not data.customer_id:
                 raise HTTPException(status_code=400, detail="customer_id is required for credit checkout")
             await db.credit_customers.update_one(
@@ -3711,22 +4834,34 @@ async def checkout_cart(data: CheckoutRequest, user: dict):
                 session=session,
             )
 
-        if data.payment_method == "credit":
+        if payment_method == "credit":
             payment_status = "on_credit"
-        elif data.payment_method == "mpesa":
+        elif payment_method == "mpesa":
             payment_status = "pending"
         else:
             payment_status = "successful"
 
+        payment_doc = {
+            "id": str(uuid.uuid4()),
+            "order_id": order_id,
+            "shop_id": user["shop_id"],
+            "amount": total_amount,
+            "method": payment_method,
+            "status": payment_status,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if abs(float(payment_doc["amount"]) - float(order["total_amount"])) > 1e-9:
+            logger.error(
+                "payment_amount_mismatch order_id=%s payment=%s order=%s",
+                order_id,
+                payment_doc["amount"],
+                order["total_amount"],
+            )
+            raise HTTPException(status_code=500, detail="Payment amount mismatch")
+
         await db.payments.insert_one(
             {
-                "id": str(uuid.uuid4()),
-                "order_id": order_id,
-                "shop_id": user["shop_id"],
-                "amount": total_amount,
-                "method": data.payment_method,
-                "status": payment_status,
-                "created_at": datetime.now(timezone.utc).isoformat(),
+                **payment_doc,
             },
             session=session,
         )
@@ -3743,7 +4878,7 @@ async def checkout_cart(data: CheckoutRequest, user: dict):
             shop_id=order["shop_id"],
             status=order["status"],
             payment_status=payment_status,
-            payment_method=data.payment_method,
+            payment_method=payment_method,
             customer_id=data.customer_id,
             items=order_items,
         )
@@ -4038,6 +5173,155 @@ def dedupe_store_views(
         if len(views) >= limit:
             break
     return views
+
+
+@api_router.get("/social/product-feed")
+async def social_product_feed(
+    format: str = "json",
+    user: dict = Depends(get_current_user),
+):
+    """
+    Build an export-friendly social catalog feed.
+    Field mapping is intentionally explicit so platform-specific connectors
+    (Meta/Facebook/Instagram/WhatsApp catalogs) can transform safely.
+    """
+    SOCIAL_COMMERCE_OBSERVABILITY["social_product_feed_requests"] += 1
+    shop = await db.shops.find_one({"id": user["shop_id"]}, {"_id": 0}) or {}
+    shop_slug = _shop_slug(shop)
+    products = await db.products.find({"shop_id": user["shop_id"]}, {"_id": 0}).to_list(10000)
+    feed = [_build_social_product_feed_item(product, shop_slug) for product in products]
+    if (format or "json").lower() != "csv":
+        return {
+            "shop_id": user["shop_id"],
+            "shop_slug": shop_slug,
+            "count": len(feed),
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "items": feed,
+        }
+
+    out = StringIO()
+    writer = csv.DictWriter(
+        out,
+        fieldnames=[
+            "product_id",
+            "title",
+            "description",
+            "price",
+            "availability",
+            "image_url",
+            "product_url",
+            "category",
+            "brand",
+        ],
+    )
+    writer.writeheader()
+    for item in feed:
+        writer.writerow({k: item.get(k) for k in writer.fieldnames})
+    return Response(content=out.getvalue(), media_type="text/csv")
+
+
+@api_router.post("/integrations/whatsapp/order")
+async def whatsapp_order_ingestion(
+    payload: WhatsAppOrderIngestionRequest,
+    user: dict = Depends(get_current_user),
+):
+    result = await _ingest_social_order(
+        shop_id=user["shop_id"],
+        channel="whatsapp",
+        phone_number=payload.phone_number,
+        line_items=[row.model_dump() for row in payload.product_ids],
+        metadata=payload.metadata or {},
+    )
+    return result
+
+
+async def _social_webhook_handler(channel: str, payload: dict, x_social_secret: Optional[str]) -> dict:
+    configured_secret = os.environ.get("SOCIAL_WEBHOOK_SECRET")
+    if configured_secret and x_social_secret != configured_secret:
+        SOCIAL_COMMERCE_OBSERVABILITY["webhook_event_errors"] += 1
+        raise HTTPException(status_code=401, detail="Invalid social webhook signature")
+
+    shop_id = str(payload.get("shop_id") or "").strip()
+    phone = str(payload.get("phone_number") or payload.get("customer_phone") or "unknown")
+    line_items = payload.get("items") or payload.get("product_ids") or []
+    metadata = payload.get("metadata") or {}
+    if not shop_id:
+        SOCIAL_COMMERCE_OBSERVABILITY["webhook_event_errors"] += 1
+        raise HTTPException(status_code=400, detail="shop_id is required")
+    try:
+        return await _ingest_social_order(
+            shop_id=shop_id,
+            channel=channel,
+            phone_number=phone,
+            line_items=line_items,
+            metadata=metadata,
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        SOCIAL_COMMERCE_OBSERVABILITY["webhook_event_errors"] += 1
+        logger.exception("social_webhook_processing_failed channel=%s", channel)
+        raise HTTPException(status_code=500, detail="Failed to process social webhook")
+
+
+@api_router.post("/webhooks/social/facebook")
+async def webhook_social_facebook(
+    payload: dict = Body(default={}),
+    x_social_secret: Optional[str] = Header(default=None),
+):
+    return await _social_webhook_handler("facebook", payload, x_social_secret)
+
+
+@api_router.post("/webhooks/social/instagram")
+async def webhook_social_instagram(
+    payload: dict = Body(default={}),
+    x_social_secret: Optional[str] = Header(default=None),
+):
+    return await _social_webhook_handler("instagram", payload, x_social_secret)
+
+
+@api_router.post("/webhooks/social/whatsapp")
+async def webhook_social_whatsapp(
+    payload: dict = Body(default={}),
+    x_social_secret: Optional[str] = Header(default=None),
+):
+    return await _social_webhook_handler("whatsapp", payload, x_social_secret)
+
+
+@api_router.get("/public/storefront/{shop_slug}")
+async def public_storefront(shop_slug: str):
+    shops = await db.shops.find({}, {"_id": 0}).to_list(5000)
+    shop = next((row for row in shops if _shop_slug(row) == shop_slug), None)
+    if not shop or not shop.get("is_active", True):
+        raise HTTPException(status_code=404, detail="Storefront not found")
+    products = await db.products.find({"shop_id": shop["id"]}, {"_id": 0}).to_list(10000)
+    return {
+        "shop": {
+            "id": shop.get("id"),
+            "slug": shop_slug,
+            "name": shop.get("name"),
+            "description": shop.get("description") or "",
+            "logo_url": shop.get("logo_url"),
+        },
+        "shareable_link": f"/public/storefront/{shop_slug}",
+        "products": [to_public_product_view(product).model_dump() for product in products],
+    }
+
+
+@api_router.get("/public/storefront/{shop_slug}/product/{product_id}")
+async def public_storefront_product(shop_slug: str, product_id: str):
+    shops = await db.shops.find({}, {"_id": 0}).to_list(5000)
+    shop = next((row for row in shops if _shop_slug(row) == shop_slug), None)
+    if not shop or not shop.get("is_active", True):
+        raise HTTPException(status_code=404, detail="Storefront not found")
+    product = await db.products.find_one({"id": product_id, "shop_id": shop["id"]}, {"_id": 0})
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+    return {
+        "shop": {"id": shop.get("id"), "slug": shop_slug, "name": shop.get("name")},
+        "product": to_public_product_view(product).model_dump(),
+        "shareable_link": f"/public/storefront/{shop_slug}/product/{product_id}",
+    }
 
 
 @api_router.get("/public/categories")

@@ -15,6 +15,7 @@ export default function CheckoutPage() {
   const whatsappTimerRef = useRef(null);
   const [retrying, setRetrying] = useState(false);
   const [isOpeningWhatsApp, setIsOpeningWhatsApp] = useState(false);
+  const [paymentMethod, setPaymentMethod] = useState('paystack');
   const {
     items,
     total_amount,
@@ -79,7 +80,7 @@ export default function CheckoutPage() {
     }
 
     try {
-      const response = await checkout();
+      const response = await checkout(paymentMethod);
       clearCartLocal();
       completedRef.current = true;
 
@@ -192,9 +193,26 @@ export default function CheckoutPage() {
 
         <section className="rounded-xl border border-slate-200 bg-white p-4">
           <h2 className="text-sm font-semibold text-slate-900">Payment method</h2>
-          <div className="mt-2 flex items-center gap-2 rounded-lg bg-slate-50 px-3 py-3 text-sm text-slate-700">
-            <CreditCard className="h-4 w-4 text-[#007BFF]" />
-            <span>Paystack</span>
+          <div className="mt-2 grid grid-cols-2 gap-2">
+            {[
+              { value: 'paystack', label: 'Paystack' },
+              { value: 'mpesa', label: 'M-Pesa' },
+              { value: 'cash', label: 'Cash' },
+              { value: 'credit', label: 'Credit' },
+            ].map((method) => (
+              <button
+                key={method.value}
+                type="button"
+                onClick={() => setPaymentMethod(method.value)}
+                className={`rounded-lg border px-3 py-2 text-sm ${paymentMethod === method.value ? 'border-[#007BFF] bg-blue-50 text-[#007BFF]' : 'border-slate-200 bg-white text-slate-700'}`}
+                disabled={isCheckingOut || retrying}
+              >
+                <span className="inline-flex items-center gap-2">
+                  <CreditCard className="h-4 w-4" />
+                  {method.label}
+                </span>
+              </button>
+            ))}
           </div>
           {error && (
             <div className="mt-3 rounded-lg border border-red-100 bg-red-50 p-3 text-sm text-red-700">

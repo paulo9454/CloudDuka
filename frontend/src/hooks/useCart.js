@@ -193,7 +193,7 @@ export const getCartMetrics = () => {
   };
 };
 
-export const checkoutRequest = async ({ idempotencyKey }) => {
+export const checkoutRequest = async ({ idempotencyKey, paymentMethod }) => {
   const headers = {
     ...useAuthStore.getState().getAuthHeaders(),
     'Content-Type': 'application/json',
@@ -203,7 +203,7 @@ export const checkoutRequest = async ({ idempotencyKey }) => {
   const res = await fetch(`${API_BASE}/customer/checkout`, {
     method: 'POST',
     headers,
-    body: JSON.stringify({}),
+    body: JSON.stringify({ payment_method: paymentMethod }),
   });
 
   const data = await res.json().catch(() => ({ detail: 'Checkout failed' }));

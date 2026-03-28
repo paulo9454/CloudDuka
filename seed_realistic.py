@@ -9,6 +9,8 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from backend.server import hash_pin
 from backend.seed_realistic import seed_realistic_async
 
+# Prefer explicit examples for local bootstrap, then allow `.env` overrides.
+load_dotenv(".env.example")
 load_dotenv()
 
 MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
@@ -36,7 +38,10 @@ async def main(faker_expand: bool):
     print(f"Sample online orders: {summary['sample_online_orders']}")
     print(f"Stock adjustments: {summary['stock_adjustments']}")
     print(f"Low-stock alerts: {summary['low_stock_alerts']}")
+    print(f"Orders by payment method: {summary.get('orders_by_payment_method', {})}")
+    print(f"Rider delivery counts: {summary.get('rider_delivery_counts', {})}")
     print(f"Sales total: {summary['sales_total']:.2f}")
+    print("Deterministic seed: enabled")
     print(f"Faker generated: {summary['faker_generated']}")
 
     client.close()
