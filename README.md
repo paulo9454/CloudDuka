@@ -2,6 +2,7 @@
 
 ## Repository structure
 - `backend/` – backend application code and APIs.
+
 - `frontend/` – frontend React application.
 - `tests/` – automated integration and utility tests.
 - `docs/ARCHITECTURE.md` – end-to-end architecture and flow documentation.
@@ -201,4 +202,12 @@ Open `http://localhost:3000` in browser and run the same checkout smoke test:
 
 ## Notes for contributors
 - Run tests and build before opening a pull request.
+
+- `frontend/` – frontend application code.
+- `tests/` – automated tests.
+- `run_staging.sh` – helper script for running a staging workflow.
+
+## Notes for contributors
+- Run project tests before opening a pull request.
+
 - Keep changes focused and include a concise summary in commits.
