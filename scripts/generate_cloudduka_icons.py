@@ -56,15 +56,38 @@ def compose_icon(mark: Image.Image, size: int, padding_ratio: float, opaque_roun
 
 def main():
     parser = argparse.ArgumentParser()
+
+    parser.add_argument("source", nargs="?", default="/tmp/user_uploaded_attachments/image_1.png", help="Path to source logo image")
+    parser.add_argument("--out", default="frontend/public/icons", help="Output directory")
+    parser.add_argument("--force", action="store_true", help="Overwrite existing generated assets if present")
+
     parser.add_argument("source", help="Path to source logo image")
     parser.add_argument("--out", default="frontend/public/icons", help="Output directory")
+
     args = parser.parse_args()
 
     src = Path(args.source)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
+    if not args.force:
+        existing = list(out.glob("app-icon-*.png")) + list(out.glob("favicon-*.png")) + list(out.glob("pwa-icon-*.png"))
+        if existing:
+            raise SystemExit(
+                "Generated icon files already exist. Re-run with --force to overwrite."
+            )
+
+    if src.exists():
+        logo = Image.open(src).convert("RGBA")
+    else:
+        logo = Image.new("RGBA", (1024, 1024), (255, 255, 255, 255))
+        draw = ImageDraw.Draw(logo)
+        draw.rounded_rectangle((170, 170, 854, 854), radius=220, fill=(10, 102, 194, 255))
+        draw.text((430, 430), "CD", fill=(255, 165, 0, 255))
+
+
     logo = Image.open(src).convert("RGBA")
+
     emblem = extract_emblem(logo)
 
     for s in APP_SIZES:
