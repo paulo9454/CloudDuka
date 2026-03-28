@@ -1,0 +1,17 @@
+# CloudDuka Icon Assets (Generated)
+
+Binary icon files are intentionally not committed here to avoid PR tooling failures with binary diffs.
+
+## Regenerate
+
+```bash
+python scripts/generate_cloudduka_icons.py /path/to/cloudduka-logo.png --force
+cp frontend/public/icons/favicon.ico frontend/public/favicon.ico
+```
+
+This generates:
+- `app-icon-*.png`
+- `favicon-*.png` + `favicon.ico`
+- `pwa-icon-*.png`
+
+Use `frontend/public/index.html` and `frontend/public/manifest.json` references as already configured.

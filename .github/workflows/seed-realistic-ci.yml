@@ -1,0 +1,84 @@
+name: Seed Realistic CI
+
+on:
+  push:
+    branches:
+      - main
+      - work
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  seed-and-test:
+    runs-on: ubuntu-latest
+    services:
+      mongodb:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ ping: 1 })'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt Pillow pytest
+
+      - name: Configure environment
+        run: |
+          echo "MONGO_URL=mongodb://localhost:27017" >> "$GITHUB_ENV"
+          echo "DB_NAME=cloudduka_ci" >> "$GITHUB_ENV"
+
+      - name: Ensure binary icon files are not tracked in Git
+        run: |
+          tracked_icons=$(git ls-files 'frontend/public/favicon.ico' 'frontend/public/icons/*.png' 'frontend/public/icons/*.ico')
+          if [ -n "$tracked_icons" ]; then
+            echo "Tracked binary icon files found (must be generated in CI only):"
+            echo "$tracked_icons"
+            exit 1
+          fi
+
+      - name: Generate CloudDuka icons dynamically
+        run: python scripts/generate_cloudduka_icons.py --force
+
+      - name: Wait for MongoDB readiness
+        run: |
+          python - <<'PY'
+          import os
+          import time
+          from pymongo import MongoClient
+
+          mongo_url = os.environ.get("MONGO_URL", "mongodb://localhost:27017")
+          deadline = time.time() + 90
+          while time.time() < deadline:
+              try:
+                  MongoClient(mongo_url, serverSelectionTimeoutMS=1000).admin.command("ping")
+                  print("MongoDB is ready")
+                  break
+              except Exception as exc:
+                  print(f"Waiting for MongoDB: {exc}")
+                  time.sleep(2)
+          else:
+              raise SystemExit("MongoDB did not become ready in time")
+          PY
+
+      - name: Run deterministic seed
+        run: python -m backend.seed_realistic
+
+      - name: Run seed regression tests
+        run: pytest -q tests/test_seed_realistic.py
