@@ -5,7 +5,11 @@ Binary icon files are intentionally not committed here to avoid PR tooling failu
 ## Regenerate
 
 ```bash
+
 python scripts/generate_cloudduka_icons.py /path/to/cloudduka-logo.png --force
+
+python scripts/generate_cloudduka_icons.py /path/to/cloudduka-logo.png
+
 cp frontend/public/icons/favicon.ico frontend/public/favicon.ico
 ```
 
