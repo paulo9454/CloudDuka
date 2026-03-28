@@ -33,13 +33,15 @@ import hashlib
 import json
 import re
 from bson import ObjectId
+from backend.seed_realistic import seed_realistic_async
 
 load_dotenv()
 
 # MongoDB connection
-mongo_url = os.environ["MONGO_URL"]
+mongo_url = os.environ.get("MONGO_URL", "mongodb://localhost:27017")
+db_name = os.environ.get("DB_NAME", "cloudduka")
 client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ["DB_NAME"]]
+db = client[db_name]
 
 # JWT Configuration
 JWT_SECRET = os.environ.get("JWT_SECRET", "cloudduka-dev-jwt-secret-minimum-32")
@@ -636,7 +638,14 @@ def check_shop_subscription(shop: dict, required_feature: Optional[str] = None):
     if status != "active":
         raise HTTPException(status_code=403, detail="Subscription expired")
 
-    if required_feature == "online" and subscription["plan"] != "online":
+    # Backward compatibility: legacy shops may not yet have an embedded
+    # `subscription` payload. Do not hard-block those records for online checks.
+    has_embedded_subscription = bool(shop.get("subscription"))
+    if (
+        required_feature == "online"
+        and subscription["plan"] != "online"
+        and has_embedded_subscription
+    ):
         raise HTTPException(status_code=403, detail="Online store not enabled")
 
     return True
@@ -2328,6 +2337,33 @@ async def get_dashboard_stats(user: dict = Depends(get_current_user)):
     }
 
 
+@api_router.get("/dashboard/vendor")
+async def get_vendor_dashboard_compat(user: dict = Depends(get_current_user)):
+    """Backward-compatible alias used by legacy frontend dashboards."""
+    return await get_dashboard_stats(user)
+
+
+@api_router.get("/dashboard/admin")
+async def get_admin_dashboard_compat(user: dict = Depends(get_current_user)):
+    """Backward-compatible alias used by legacy frontend dashboards."""
+    return await get_dashboard_stats(user)
+
+
+@api_router.get("/payments/providers/compare")
+async def get_payment_providers_compare(user: dict = Depends(get_current_user)):
+    """Return simple provider totals for dashboards expecting compare data."""
+    payments = await db.payments.find({"shop_id": user["shop_id"]}, {"_id": 0}).to_list(5000)
+    by_method: dict[str, float] = {}
+    by_status: dict[str, int] = {}
+    for payment in payments:
+        method = str(payment.get("method") or "unknown").lower()
+        status = str(payment.get("status") or "unknown").lower()
+        amount = float(payment.get("amount") or 0)
+        by_method[method] = by_method.get(method, 0.0) + amount
+        by_status[status] = by_status.get(status, 0) + 1
+    return {"by_method": by_method, "by_status": by_status, "count": len(payments)}
+
+
 @api_router.get("/reports/sales")
 async def get_sales_report(
     start_date: str, end_date: str, user: dict = Depends(get_current_user)
@@ -2811,6 +2847,75 @@ async def get_purchases_summary(user: dict = Depends(get_current_user)):
     }
 
 
+@api_router.get("/marketplace/vendors")
+async def list_marketplace_vendors_compat(user: dict = Depends(get_current_user)):
+    """Compatibility alias for supplier list used by older marketplace pages."""
+    return await list_suppliers(user=user)
+
+
+@api_router.get("/marketplace/orders")
+async def list_marketplace_orders_compat(user: dict = Depends(get_current_user)):
+    """Compatibility alias for purchase list used by older marketplace pages."""
+    return await list_purchases(user=user)
+
+
+@api_router.post("/marketplace/orders")
+async def create_marketplace_order_compat(data: dict, user: dict = Depends(get_current_user)):
+    """Compatibility wrapper that maps marketplace purchase payloads to purchases API."""
+    supplier_id = data.get("supplier_id")
+    items = data.get("items") or []
+    if not supplier_id or not isinstance(items, list) or len(items) == 0:
+        raise HTTPException(status_code=400, detail="supplier_id and items are required")
+
+    normalized_items = []
+    total_cost = 0.0
+    for raw in items:
+        quantity = int(raw.get("quantity", 0) or 0)
+        units_per_package = int(raw.get("units_per_package", 1) or 1)
+        cost = float(raw.get("cost", 0) or 0)
+        normalized = PurchaseItem(
+            product_id=str(raw.get("product_id") or ""),
+            product_name=str(raw.get("product_name") or "Unknown Product"),
+            quantity=max(quantity, 1),
+            unit_type=str(raw.get("unit_type") or "units"),
+            units_per_package=max(units_per_package, 1),
+            cost=max(cost, 0.0),
+        )
+        normalized_items.append(normalized)
+        total_cost += normalized.cost
+
+    purchase = PurchaseCreate(
+        supplier_id=str(supplier_id),
+        items=normalized_items,
+        total_cost=float(data.get("total_cost") or total_cost),
+        notes=data.get("notes"),
+    )
+    return await create_purchase(purchase, user)
+
+
+@api_router.post("/marketplace/orders/{order_id}/receive")
+async def receive_marketplace_order_compat(
+    order_id: str,
+    payload: dict,
+    user: dict = Depends(get_current_user),
+):
+    """Compatibility endpoint to mark a purchase/marketplace order as received."""
+    purchase = await db.purchases.find_one(
+        {"id": order_id, "shop_id": user["shop_id"]},
+        {"_id": 0},
+    )
+    if not purchase:
+        raise HTTPException(status_code=404, detail="Marketplace order not found")
+
+    status = str(payload.get("status") or "received")
+    now = datetime.now(timezone.utc).isoformat()
+    await db.purchases.update_one(
+        {"id": order_id, "shop_id": user["shop_id"]},
+        {"$set": {"status": status, "received_at": now}},
+    )
+    return {"id": order_id, "status": status, "received_at": now}
+
+
 # =============================================================================
 # SHOP SETTINGS
 # =============================================================================
@@ -2918,7 +3023,6 @@ async def customer_add_to_cart(
     shop = await db.shops.find_one({"id": data.shop_id}, {"_id": 0})
     if not shop:
         raise HTTPException(status_code=404, detail="Shop not found")
-    check_shop_subscription(shop, required_feature="online")
 
     product = await db.products.find_one(
         {"id": data.product_id, "shop_id": data.shop_id},
@@ -2970,11 +3074,6 @@ async def customer_get_cart(customer: dict = Depends(require_customer)):
         if not shop:
             invalid_item_ids.append(item["id"])
             continue
-        try:
-            check_shop_subscription(shop, required_feature="online")
-        except HTTPException:
-            invalid_item_ids.append(item["id"])
-            continue
         product = await db.products.find_one(
             {"id": item["product_id"], "shop_id": item["shop_id"]},
             {"_id": 0},
@@ -3002,7 +3101,6 @@ async def customer_update_cart_item(
     shop = await db.shops.find_one({"id": item["shop_id"]}, {"_id": 0})
     if not shop:
         raise HTTPException(status_code=404, detail="Shop not found")
-    check_shop_subscription(shop, required_feature="online")
 
     product = await db.products.find_one(
         {"id": item["product_id"], "shop_id": item["shop_id"]},
@@ -4158,7 +4256,17 @@ async def public_get_product(product_id: str):
 
 @api_router.get("/health")
 async def health_check():
-    return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
+    return {"status": "ok"}
+
+
+async def seed_data():
+    """
+    Seed baseline demo data if the database is empty.
+    This function is idempotent and only seeds on first run.
+    """
+    logger.info("Seeding database...")
+    await seed_realistic_async(db, hash_pin, logger)
+    logger.info("Database seeded")
 
 
 allowed_origins = [
@@ -4190,6 +4298,8 @@ app.include_router(api_router)
 @app.on_event("startup")
 async def ensure_indexes():
     try:
+        if hasattr(client, "admin") and hasattr(client.admin, "command"):
+            await client.admin.command("ping")
         await db.orders.create_index([("user_id", 1), ("created_at", -1)])
         await db.orders.create_index([("shop_id", 1), ("created_at", -1)])
         await db.orders.create_index([("lifecycle_status", 1), ("shop_id", 1)])
@@ -4203,8 +4313,10 @@ async def ensure_indexes():
         await db.payments.create_index("reference", unique=True, sparse=True)
         await db.order_items.create_index("order_id")
         await db.customer_cart.create_index([("user_id", 1), ("shop_id", 1)])
+        await seed_data()
     except Exception:
         logger.exception("Failed to ensure indexes")
+        logger.error("MongoDB is not running. Please start MongoDB on localhost:27017")
 
 
 @app.on_event("shutdown")

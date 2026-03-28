@@ -34,6 +34,9 @@ import OrdersPage from './pages/OrdersPage';
 import VendorDashboardPage from './pages/VendorDashboardPage';
 import AdminDashboardPage from './pages/AdminDashboardPage';
 const HomePage = lazy(() => import('./pages/HomePage'));
+const CartPage = lazy(() => import('./pages/CartPage'));
+const CheckoutPage = lazy(() => import('./pages/CheckoutPage'));
+const OrderSuccess = lazy(() => import('./pages/OrderSuccess'));
 
 // Protected Route Component
 const ProtectedRoute = ({ children }) => {
@@ -219,6 +222,31 @@ function App() {
             element={(
               <Suspense fallback={<div className="min-h-screen bg-slate-50 p-4">Loading marketplace...</div>}>
                 <HomePage />
+              </Suspense>
+            )}
+          />
+          
+          <Route
+            path="/cart"
+            element={(
+              <Suspense fallback={<div className="min-h-screen bg-slate-50 p-4">Loading cart...</div>}>
+                <CartPage />
+              </Suspense>
+            )}
+          />
+          <Route
+            path="/checkout"
+            element={(
+              <Suspense fallback={<div className="min-h-screen bg-slate-50 p-4">Loading checkout...</div>}>
+                <CheckoutPage />
+              </Suspense>
+            )}
+          />
+          <Route
+            path="/order-success"
+            element={(
+              <Suspense fallback={<div className="min-h-screen bg-slate-50 p-4">Loading order...</div>}>
+                <OrderSuccess />
               </Suspense>
             )}
           />
