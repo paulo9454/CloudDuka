@@ -1,7 +1,6 @@
 import { create } from 'zustand';
 import { api, useAuthStore } from '../lib/store';
-
-const API_BASE = `${process.env.REACT_APP_BACKEND_URL || ''}/api`;
+import { API_BASE } from '../lib/apiBase';
 
 const normalizeCart = (payload) => {
   const items = Array.isArray(payload?.items)

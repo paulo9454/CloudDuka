@@ -61,8 +61,14 @@ def main():
     parser.add_argument("--out", default="frontend/public/icons", help="Output directory")
     parser.add_argument("--force", action="store_true", help="Overwrite existing generated assets if present")
 
+
+    parser.add_argument("source", nargs="?", default="/tmp/user_uploaded_attachments/image_1.png", help="Path to source logo image")
+    parser.add_argument("--out", default="frontend/public/icons", help="Output directory")
+    parser.add_argument("--force", action="store_true", help="Overwrite existing generated assets if present")
+
     parser.add_argument("source", help="Path to source logo image")
     parser.add_argument("--out", default="frontend/public/icons", help="Output directory")
+
 
     args = parser.parse_args()
 
@@ -86,7 +92,9 @@ def main():
         draw.text((430, 430), "CD", fill=(255, 165, 0, 255))
 
 
+
     logo = Image.open(src).convert("RGBA")
+
 
     emblem = extract_emblem(logo)
 
