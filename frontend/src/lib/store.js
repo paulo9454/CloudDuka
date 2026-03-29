@@ -1,7 +1,8 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
+import { API_BASE } from './apiBase';
 
-const API_URL = `${process.env.REACT_APP_BACKEND_URL}/api`;
+const API_URL = API_BASE;
 
 // Auth Store
 export const useAuthStore = create(
@@ -170,12 +171,19 @@ export const useOfflineStore = create(
 
 // API Helper
 export const api = {
+  _formatError: (res, data) => {
+    if (res.status === 401) return new Error(data.detail || 'Session expired. Please log in again.');
+    if (res.status === 422) return new Error(data.detail || 'Validation failed. Please review your input.');
+    if (res.status >= 500) return new Error('Server error. Please try again shortly.');
+    return new Error(data.detail || 'Request failed');
+  },
+
   get: async (endpoint) => {
     const headers = useAuthStore.getState().getAuthHeaders();
     const res = await fetch(`${API_URL}${endpoint}`, { headers });
     const data = await res.json().catch(() => ({ detail: 'Request failed' }));
     if (!res.ok) {
-      throw new Error(data.detail || 'Request failed');
+      throw api._formatError(res, data);
     }
     return data;
   },
@@ -189,7 +197,7 @@ export const api = {
     });
     const data = await res.json().catch(() => ({ detail: 'Request failed' }));
     if (!res.ok) {
-      throw new Error(data.detail || 'Request failed');
+      throw api._formatError(res, data);
     }
     return data;
   },
@@ -203,7 +211,7 @@ export const api = {
     });
     const data = await res.json().catch(() => ({ detail: 'Request failed' }));
     if (!res.ok) {
-      throw new Error(data.detail || 'Request failed');
+      throw api._formatError(res, data);
     }
     return data;
   },
@@ -216,7 +224,7 @@ export const api = {
     });
     const data = await res.json().catch(() => ({ detail: 'Request failed' }));
     if (!res.ok) {
-      throw new Error(data.detail || 'Request failed');
+      throw api._formatError(res, data);
     }
     return data;
   },

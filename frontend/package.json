@@ -59,8 +59,9 @@
     "zustand": "^5.0.10"
   },
   "scripts": {
-    "start": "craco start",
-    "build": "craco build",
+    "generate:icons": "python ../scripts/generate_cloudduka_icons.py --out public/icons --force && cp public/icons/favicon.ico public/favicon.ico",
+    "start": "npm run generate:icons && craco start",
+    "build": "npm run generate:icons && craco build",
     "test": "craco test"
   },
   "browserslist": {

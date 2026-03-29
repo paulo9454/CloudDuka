@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import random
 import uuid
+import logging
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional
 from math import radians, sin, cos, sqrt, atan2
@@ -13,6 +14,26 @@ except Exception:  # pragma: no cover
 
 
 PAYMENT_METHODS = ["cash", "mpesa", "credit", "paystack"]
+LOW_STOCK_THRESHOLD = 10
+MODULE_LOGGER = logging.getLogger(__name__)
+REQUIRED_COLLECTIONS = [
+    "users",
+    "shops",
+    "products",
+    "orders",
+    "subscriptions",
+    "riders",
+    "shop_users",
+    "categories",
+    "vendors",
+    "suppliers",
+    "sales",
+    "order_items",
+    "payments",
+    "deliveries",
+    "damaged_stock",
+    "shop_recommendations",
+]
 
 
 def _now_iso() -> str:
@@ -213,11 +234,30 @@ async def _validate_stock(db, items: List[dict]) -> bool:
 
 
 async def _deduct_stock(db, items: List[dict]):
+    adjustments = 0
+    low_stock_alerts = 0
     for item in items:
         await db.products.update_one(
             {"id": item["product_id"]},
             {"$inc": {"stock_quantity": -int(item["quantity"]), "stock": -int(item["quantity"])}, "$set": {"updated_at": _now_iso()}},
         )
+        adjustments += int(item["quantity"])
+        product = await db.products.find_one({"id": item["product_id"]}, {"_id": 0})
+        if product and int(product.get("stock_quantity", 0)) <= LOW_STOCK_THRESHOLD:
+            alert_id = f"low-stock-{item['product_id']}"
+            if not await db.stock_alerts.find_one({"id": alert_id}, {"_id": 0}):
+                await db.stock_alerts.insert_one(
+                    {
+                        "id": alert_id,
+                        "product_id": item["product_id"],
+                        "shop_id": product.get("shop_id"),
+                        "stock_quantity": int(product.get("stock_quantity", 0)),
+                        "threshold": LOW_STOCK_THRESHOLD,
+                        "created_at": _now_iso(),
+                    }
+                )
+                low_stock_alerts += 1
+    return {"adjustments": adjustments, "low_stock_alerts": low_stock_alerts}
 
 
 def _distance_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
@@ -230,8 +270,125 @@ def _distance_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
 
 
 async def _ensure_geo_indexes(db):
-    await db.shops.create_index([("geo_location", "2dsphere")])
-    await db.users.create_index([("current_location", "2dsphere")], sparse=True)
+    async def _get_indexes(collection):
+        if not hasattr(collection, "list_indexes"):
+            return []
+        indexes = collection.list_indexes()
+        if hasattr(indexes, "to_list"):
+            return await indexes.to_list(None)
+        if hasattr(indexes, "__aiter__"):
+            return [doc async for doc in indexes]
+        return []
+
+    shop_indexes = await _get_indexes(db.shops)
+    has_shop_geo = any(idx.get("key", {}).get("geo_location") == "2dsphere" for idx in shop_indexes)
+    if not has_shop_geo:
+        await db.shops.create_index([("geo_location", "2dsphere")])
+
+    user_indexes = await _get_indexes(db.users)
+    has_user_geo = any(idx.get("key", {}).get("current_location") == "2dsphere" for idx in user_indexes)
+    if not has_user_geo:
+        await db.users.create_index([("current_location", "2dsphere")], sparse=True)
+
+
+async def _ensure_geo_fields(db):
+    shops = await db.shops.find({}, {"_id": 0}).to_list(5000)
+    shop_backfills = 0
+    for shop in shops:
+        if shop.get("geo_location"):
+            continue
+        loc = shop.get("location") or {}
+        if "lat" in loc and "lng" in loc:
+            await db.shops.update_one(
+                {"id": shop["id"]},
+                {"$set": {"geo_location": {"type": "Point", "coordinates": [loc["lng"], loc["lat"]]}}},
+            )
+            shop_backfills += 1
+
+    customers = await db.users.find({"role": "customer"}, {"_id": 0}).to_list(5000)
+    customer_backfills = 0
+    for customer in customers:
+        if customer.get("current_location"):
+            continue
+        recommended_shop = await db.shops.find_one({"is_active": True}, {"_id": 0})
+        if not recommended_shop:
+            continue
+        loc = recommended_shop.get("location") or {}
+        lat = float(loc.get("lat", -1.286389))
+        lng = float(loc.get("lng", 36.817223))
+        await db.users.update_one(
+            {"id": customer["id"]},
+            {"$set": {"current_location": {"lat": lat, "lng": lng}}},
+        )
+        customer_backfills += 1
+
+    if shop_backfills:
+        MODULE_LOGGER.warning("Backfilled geo_location for %s shops", shop_backfills)
+    if customer_backfills:
+        MODULE_LOGGER.warning("Backfilled current_location for %s customers", customer_backfills)
+
+
+def _verify_seed_dependencies(db):
+    # Defensive backfill for environments that model riders inside `users`.
+    if not hasattr(db, "riders") and hasattr(db, "users"):
+        setattr(db, "riders", db.users)
+        MODULE_LOGGER.warning("Using riders collection fallback mapped to users")
+
+    missing_collections = [name for name in REQUIRED_COLLECTIONS if not hasattr(db, name)]
+    if missing_collections:
+        raise RuntimeError(f"Missing required collections: {', '.join(sorted(missing_collections))}")
+
+    for fn in (_validate_stock, _deduct_stock, _calculate_total):
+        if not callable(fn):
+            raise RuntimeError(f"Seed dependency is not callable: {fn}")
+
+    try:
+        from backend import server as backend_server
+    except Exception:
+        return
+    auth_dependency = getattr(backend_server, "get_current_user", None)
+    if auth_dependency is None or not callable(auth_dependency):
+        # Seeder does not invoke auth directly, so keep this safe and non-fatal.
+        MODULE_LOGGER.warning("Missing auth middleware/dependency: get_current_user")
+
+
+async def _user_exists(db, user: dict) -> bool:
+    if await db.users.find_one({"phone": user.get("phone")}, {"_id": 0}):
+        return True
+    email = user.get("email")
+    if email and await db.users.find_one({"email": email}, {"_id": 0}):
+        return True
+    return False
+
+
+async def _shop_exists(db, shop: dict) -> bool:
+    if await db.shops.find_one({"id": shop.get("id")}, {"_id": 0}):
+        return True
+    code = shop.get("code")
+    if code and await db.shops.find_one({"code": code}, {"_id": 0}):
+        return True
+    return False
+
+
+async def _collect_observability(db) -> dict:
+    payments = await db.payments.find({}, {"_id": 0}).to_list(10000)
+    deliveries = await db.deliveries.find({}, {"_id": 0}).to_list(10000)
+    orders_by_payment_method = {method: 0 for method in PAYMENT_METHODS}
+    for payment in payments:
+        method = str(payment.get("method", "")).lower()
+        if method in orders_by_payment_method:
+            orders_by_payment_method[method] += 1
+
+    rider_delivery_counts = {}
+    for delivery in deliveries:
+        rider_id = delivery.get("rider_id")
+        if not rider_id:
+            continue
+        rider_delivery_counts[rider_id] = rider_delivery_counts.get(rider_id, 0) + 1
+    return {
+        "orders_by_payment_method": orders_by_payment_method,
+        "rider_delivery_counts": rider_delivery_counts,
+    }
 
 
 async def _upsert_customer_recommendations(db):
@@ -282,6 +439,10 @@ async def _faker_expand_async(db, hash_pin: Callable[[str], str], summary: dict,
                 "email": email,
                 "address": address,
                 "role": "customer",
+                "current_location": {
+                    "lat": round(random.uniform(-4.1, -0.05), 6),
+                    "lng": round(random.uniform(34.7, 39.7), 6),
+                },
                 "pin_hash": hash_pin("1234"),
                 "created_at": now,
             }
@@ -378,6 +539,7 @@ async def _faker_expand_async(db, hash_pin: Callable[[str], str], summary: dict,
 
 
 async def seed_realistic_async(db, hash_pin: Callable[[str], str], logger, faker_expand: bool = False) -> dict:
+    _verify_seed_dependencies(db)
     data = _seed_blueprint()
     summary = {
         "owners_shops": 0,
@@ -396,12 +558,12 @@ async def seed_realistic_async(db, hash_pin: Callable[[str], str], logger, faker
     await _ensure_geo_indexes(db)
 
     for account in data["owners_and_partner"]:
-        if not await db.users.find_one({"phone": account["phone"]}, {"_id": 0}):
+        if not await _user_exists(db, account):
             await db.users.insert_one({**account, "pin_hash": hash_pin("1234")})
             summary["owners_shops"] += 1
 
     for shop in data["shops"]:
-        if not await db.shops.find_one({"id": shop["id"]}, {"_id": 0}):
+        if not await _shop_exists(db, shop):
             await db.shops.insert_one(shop)
             summary["owners_shops"] += 1
         if not await db.subscriptions.find_one({"shop_id": shop["id"]}, {"_id": 0}):
@@ -417,7 +579,7 @@ async def seed_realistic_async(db, hash_pin: Callable[[str], str], logger, faker
             )
 
     for keeper in data["shopkeepers"]:
-        if not await db.users.find_one({"phone": keeper["phone"]}, {"_id": 0}):
+        if not await _user_exists(db, keeper):
             await db.users.insert_one({**keeper, "pin_hash": hash_pin("1234")})
             summary["shopkeepers"] += 1
         if not await db.shop_users.find_one({"user_id": keeper["id"], "shop_id": keeper["shop_id"], "role": "shopkeeper"}, {"_id": 0}):
@@ -433,7 +595,7 @@ async def seed_realistic_async(db, hash_pin: Callable[[str], str], logger, faker
             summary["shopkeepers"] += 1
 
     for rider in data["riders"]:
-        if not await db.users.find_one({"phone": rider["phone"]}, {"_id": 0}):
+        if not await _user_exists(db, rider):
             await db.users.insert_one({**rider, "pin_hash": hash_pin("1234")})
             summary["riders"] += 1
 
@@ -456,7 +618,7 @@ async def seed_realistic_async(db, hash_pin: Callable[[str], str], logger, faker
             summary["vendors_products"] += 1
 
     for customer in data["customers"]:
-        if not await db.users.find_one({"phone": customer["phone"]}, {"_id": 0}):
+        if not await _user_exists(db, customer):
             await db.users.insert_one({**customer, "pin_hash": hash_pin("1234")})
             summary["customers"] += 1
 
@@ -464,8 +626,11 @@ async def seed_realistic_async(db, hash_pin: Callable[[str], str], logger, faker
     if not await db.damaged_stock.find_one({"id": "seed-damaged-1"}, {"_id": 0}):
         product = await db.products.find_one({"id": "prod-soap-bar"}, {"_id": 0})
         if product and product.get("stock_quantity", 0) >= 2:
-            await db.products.update_one({"id": product["id"]}, {"$inc": {"stock_quantity": -2, "stock": -2}})
-            summary["stock_adjustments"] += 2
+            deduction = await _deduct_stock(
+                db, [{"product_id": product["id"], "quantity": 2, "unit_price": float(product.get("unit_price", 0.0))}]
+            )
+            summary["stock_adjustments"] += deduction["adjustments"]
+            summary["low_stock_alerts"] += deduction["low_stock_alerts"]
             await db.damaged_stock.insert_one(
                 {
                     "id": "seed-damaged-1",
@@ -483,8 +648,9 @@ async def seed_realistic_async(db, hash_pin: Callable[[str], str], logger, faker
     if not await db.sales.find_one({"id": "seed-sale-pos-1"}, {"_id": 0}):
         pos_items = [{"product_id": "prod-sugar-2kg", "quantity": 1, "unit_price": 310.0}]
         if await _validate_stock(db, pos_items):
-            await _deduct_stock(db, pos_items)
-            summary["stock_adjustments"] += sum(i["quantity"] for i in pos_items)
+            deduction = await _deduct_stock(db, pos_items)
+            summary["stock_adjustments"] += deduction["adjustments"]
+            summary["low_stock_alerts"] += deduction["low_stock_alerts"]
             total = _calculate_total(pos_items)
             await db.sales.insert_one(
                 {
@@ -509,8 +675,9 @@ async def seed_realistic_async(db, hash_pin: Callable[[str], str], logger, faker
             {"product_id": "prod-mineral-water-1l", "quantity": 3, "unit_price": 70.0},
         ]
         if await _validate_stock(db, online_items):
-            await _deduct_stock(db, online_items)
-            summary["stock_adjustments"] += sum(i["quantity"] for i in online_items)
+            deduction = await _deduct_stock(db, online_items)
+            summary["stock_adjustments"] += deduction["adjustments"]
+            summary["low_stock_alerts"] += deduction["low_stock_alerts"]
             total = _calculate_total(online_items)
             now = _now_iso()
             await db.orders.insert_one(
@@ -583,29 +750,84 @@ async def seed_realistic_async(db, hash_pin: Callable[[str], str], logger, faker
             summary["sample_online_orders"] += 1
             summary["sales_total"] += total
 
-    # additional payment diversity samples
-    for method in PAYMENT_METHODS:
+    # additional payment diversity samples (amount always equals order total)
+    method_samples = {
+        "cash": {"order_id": "seed-order-cash", "product_id": "prod-rice-2kg", "quantity": 1},
+        "mpesa": {"order_id": "seed-order-mpesa", "product_id": "prod-cooking-oil-1l", "quantity": 1},
+        "credit": {"order_id": "seed-order-credit", "product_id": "prod-bath-tissue-4pk", "quantity": 1},
+        "paystack": {"order_id": "seed-order-paystack", "product_id": "prod-orange-juice-1l", "quantity": 1},
+    }
+    for method, sample in method_samples.items():
+        order_id = sample["order_id"]
         payment_id = f"seed-payment-{method}"
+        if await db.orders.find_one({"id": order_id}, {"_id": 0}):
+            continue
+        product = await db.products.find_one({"id": sample["product_id"]}, {"_id": 0})
+        if not product:
+            continue
+        order_items = [
+            {
+                "product_id": product["id"],
+                "quantity": int(sample["quantity"]),
+                "unit_price": float(product["unit_price"]),
+            }
+        ]
+        if not await _validate_stock(db, order_items):
+            continue
+        deduction = await _deduct_stock(db, order_items)
+        summary["stock_adjustments"] += deduction["adjustments"]
+        summary["low_stock_alerts"] += deduction["low_stock_alerts"]
+        total = _calculate_total(order_items)
+        now = _now_iso()
+        await db.orders.insert_one(
+            {
+                "id": order_id,
+                "order_number": order_id,
+                "user_id": "customer-demo-2",
+                "shop_id": product["shop_id"],
+                "status": "completed",
+                "lifecycle_status": "delivered",
+                "source": "customer_app",
+                "is_online_order": True,
+                "total_amount": total,
+                "created_at": now,
+            }
+        )
+        await db.order_items.insert_one(
+            {
+                "id": f"{order_id}-item-1",
+                "order_id": order_id,
+                "shop_id": product["shop_id"],
+                "product_id": product["id"],
+                "product_name": product["name"],
+                "quantity": int(sample["quantity"]),
+                "unit_price": float(product["unit_price"]),
+                "total": total,
+                "created_at": now,
+            }
+        )
         if not await db.payments.find_one({"id": payment_id}, {"_id": 0}):
             await db.payments.insert_one(
                 {
                     "id": payment_id,
-                    "shop_id": "shop-kisumu-online",
-                    "order_id": f"seed-order-{method}",
-                    "amount": float(random.choice([250.0, 500.0, 1100.0])),
+                    "shop_id": product["shop_id"],
+                    "order_id": order_id,
+                    "amount": total,
                     "method": method,
                     "status": "successful",
                     "reference": f"seed-{method}-ref",
-                    "created_at": _now_iso(),
+                    "created_at": now,
                 }
             )
 
+    await _ensure_geo_fields(db)
     await _upsert_customer_recommendations(db)
 
     if faker_expand:
         await _faker_expand_async(db, hash_pin, summary)
 
-    summary["low_stock_alerts"] = await db.products.count_documents({"stock_quantity": {"$lte": 10}})
+    summary["low_stock_alerts"] += await db.products.count_documents({"stock_quantity": {"$lte": LOW_STOCK_THRESHOLD}})
+    summary.update(await _collect_observability(db))
 
     logger.info(
         "Realistic seed summary: owners+shops=%s, shopkeepers=%s, vendors+products=%s, customers=%s, riders=%s, pos_orders=%s, online_orders=%s, stock_adjustments=%s, low_stock_alerts=%s, sales_total=%.2f, faker=%s",

@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-
-const API_BASE = `${process.env.REACT_APP_BACKEND_URL || ''}/api`;
+import { API_BASE } from '../lib/apiBase';
 
 async function fetchJson(path, signal) {
   const response = await fetch(`${API_BASE}${path}`, { signal });

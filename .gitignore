@@ -115,3 +115,8 @@ frontend/node_modules/.cache/default-development/8.pack
 # Environment files
 *.env
 *.env.*
+
+# Generated icon binaries (rebuild via scripts/generate_cloudduka_icons.py)
+frontend/public/favicon.ico
+frontend/public/icons/*.png
+frontend/public/icons/*.ico
