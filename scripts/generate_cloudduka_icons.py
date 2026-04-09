@@ -5,8 +5,6 @@ This keeps binary assets out of git history when PR tooling cannot process binar
 """
 from pathlib import Path
 import argparse
-import csv
-from io import StringIO
 
 from PIL import Image, ImageOps, ImageDraw
 import numpy as np
@@ -57,17 +55,18 @@ def compose_icon(mark: Image.Image, size: int, padding_ratio: float, opaque_roun
 def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("source", nargs="?", default="/tmp/user_uploaded_attachments/image_1.png", help="Path to source logo image")
+    parser.add_argument(
+        "source",
+        nargs="?",
+        default="/tmp/user_uploaded_attachments/image_1.png",
+        help="Path to source logo image",
+    )
     parser.add_argument("--out", default="frontend/public/icons", help="Output directory")
-    parser.add_argument("--force", action="store_true", help="Overwrite existing generated assets if present")
-
-
-    parser.add_argument("source", nargs="?", default="/tmp/user_uploaded_attachments/image_1.png", help="Path to source logo image")
-    parser.add_argument("--out", default="frontend/public/icons", help="Output directory")
-    parser.add_argument("--force", action="store_true", help="Overwrite existing generated assets if present")
-
-    parser.add_argument("source", help="Path to source logo image")
-    parser.add_argument("--out", default="frontend/public/icons", help="Output directory")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing generated assets if present",
+    )
 
 
     args = parser.parse_args()
@@ -77,7 +76,11 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
 
     if not args.force:
-        existing = list(out.glob("app-icon-*.png")) + list(out.glob("favicon-*.png")) + list(out.glob("pwa-icon-*.png"))
+        existing = (
+            list(out.glob("app-icon-*.png"))
+            + list(out.glob("favicon-*.png"))
+            + list(out.glob("pwa-icon-*.png"))
+        )
         if existing:
             raise SystemExit(
                 "Generated icon files already exist. Re-run with --force to overwrite."
@@ -90,10 +93,6 @@ def main():
         draw = ImageDraw.Draw(logo)
         draw.rounded_rectangle((170, 170, 854, 854), radius=220, fill=(10, 102, 194, 255))
         draw.text((430, 430), "CD", fill=(255, 165, 0, 255))
-
-
-
-    logo = Image.open(src).convert("RGBA")
 
 
     emblem = extract_emblem(logo)

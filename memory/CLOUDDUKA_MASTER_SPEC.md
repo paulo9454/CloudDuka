@@ -30,8 +30,8 @@ CloudDuka is a cloud-based, mobile-first POS system designed for retail shops in
 | Shopkeeper | Sales, M-Pesa payments, credit sales, view products (no delete) |
 
 ### Pricing
-- **Monthly:** KES 499
-- **Annual:** KES 5,000 (save 17%)
+- **POS + Physical Shop:** KES 500/month
+- **POS + Online Store:** KES 1,000/month
 - **Free Trial:** 14 days
 
 ---
