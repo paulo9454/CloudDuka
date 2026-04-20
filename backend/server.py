@@ -1356,7 +1356,8 @@ async def _ingest_social_order(
         SOCIAL_COMMERCE_OBSERVABILITY["webhook_event_errors"] += 1
         raise HTTPException(status_code=400, detail="Shop owner not configured")
 
-    cart = await db.cart.find_one({"user_id": actor_user_id, "shop_id": shop_id}, {"_id": 0})
+    social_cart_user_id = f"social-order:{shop_id}:{phone_number or 'unknown'}"
+    cart = await db.cart.find_one({"user_id": social_cart_user_id, "shop_id": shop_id}, {"_id": 0})
     cart_id = cart.get("id") if cart else str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
     cart_items = [
@@ -1373,7 +1374,7 @@ async def _ingest_social_order(
         {
             "$set": {
                 "id": cart_id,
-                "user_id": actor_user_id,
+                "user_id": social_cart_user_id,
                 "shop_id": shop_id,
                 "items": cart_items,
                 "updated_at": now,
@@ -1389,12 +1390,13 @@ async def _ingest_social_order(
             customer_name=(metadata or {}).get("customer_name"),
             customer_id=(metadata or {}).get("customer_id"),
         ),
-        {"id": actor_user_id, "shop_id": shop_id},
+        {"id": social_cart_user_id, "shop_id": shop_id},
     )
     await db.orders.update_one(
         {"id": checkout.id, "shop_id": shop_id},
         {
             "$set": {
+                "user_id": actor_user_id,
                 "source": f"social_{channel}",
                 "social_channel": channel,
                 "social_phone_number": phone_number,
@@ -1959,6 +1961,47 @@ async def list_products(
 
 # -----------------------------------------------------------------------------
 
+@api_router.get("/products/low-stock")
+async def list_low_stock_products(
+    period_days: int = 30,
+    user: dict = Depends(get_current_user),
+):
+    await validate_shop_access(user, user.get("shop_id"))
+    velocity_by_product = await compute_sales_velocity(user["shop_id"], days=max(period_days, 1))
+    products = await db.products.find(
+        {
+            "shop_id": user["shop_id"],
+            "$expr": {"$lte": ["$stock_quantity", "$min_stock_level"]},
+        },
+        {"_id": 0},
+    ).to_list(5000)
+    fast_threshold = 1.0
+    slow_threshold = 0.1
+    for product in products:
+        velocity = float(velocity_by_product.get(product.get("id"), product.get("sales_velocity", 0.0)) or 0.0)
+        product["sales_velocity"] = velocity
+        product["movement"] = "fast_moving" if velocity >= fast_threshold else ("slow_moving" if velocity <= slow_threshold else "steady")
+    return {"count": len(products), "products": products}
+
+
+@api_router.get("/products/out-of-stock")
+async def list_out_of_stock_products(
+    period_days: int = 30,
+    user: dict = Depends(get_current_user),
+):
+    await validate_shop_access(user, user.get("shop_id"))
+    velocity_by_product = await compute_sales_velocity(user["shop_id"], days=max(period_days, 1))
+    products = await db.products.find(
+        {"shop_id": user["shop_id"], "stock_quantity": {"$lte": 0}},
+        {"_id": 0},
+    ).to_list(5000)
+    for product in products:
+        product["sales_velocity"] = float(velocity_by_product.get(product.get("id"), product.get("sales_velocity", 0.0)) or 0.0)
+    return {"count": len(products), "products": products}
+
+
+# -----------------------------------------------------------------------------
+
 @api_router.get("/products/{product_id}", response_model=ProductResponse)
 async def get_product(
     product_id: str,
@@ -2116,45 +2159,6 @@ async def list_categories_simple(
         ]
 
     return categories
-
-
-@api_router.get("/products/low-stock")
-async def list_low_stock_products(
-    period_days: int = 30,
-    user: dict = Depends(get_current_user),
-):
-    await validate_shop_access(user, user.get("shop_id"))
-    velocity_by_product = await compute_sales_velocity(user["shop_id"], days=max(period_days, 1))
-    products = await db.products.find(
-        {
-            "shop_id": user["shop_id"],
-            "$expr": {"$lte": ["$stock_quantity", "$min_stock_level"]},
-        },
-        {"_id": 0},
-    ).to_list(5000)
-    fast_threshold = 1.0
-    slow_threshold = 0.1
-    for product in products:
-        velocity = float(velocity_by_product.get(product.get("id"), product.get("sales_velocity", 0.0)) or 0.0)
-        product["sales_velocity"] = velocity
-        product["movement"] = "fast_moving" if velocity >= fast_threshold else ("slow_moving" if velocity <= slow_threshold else "steady")
-    return {"count": len(products), "products": products}
-
-
-@api_router.get("/products/out-of-stock")
-async def list_out_of_stock_products(
-    period_days: int = 30,
-    user: dict = Depends(get_current_user),
-):
-    await validate_shop_access(user, user.get("shop_id"))
-    velocity_by_product = await compute_sales_velocity(user["shop_id"], days=max(period_days, 1))
-    products = await db.products.find(
-        {"shop_id": user["shop_id"], "stock_quantity": {"$lte": 0}},
-        {"_id": 0},
-    ).to_list(5000)
-    for product in products:
-        product["sales_velocity"] = float(velocity_by_product.get(product.get("id"), product.get("sales_velocity", 0.0)) or 0.0)
-    return {"count": len(products), "products": products}
 
 
 @api_router.get("/inventory/restock-suggestions")
@@ -3636,9 +3640,14 @@ async def create_purchase(data: PurchaseCreate, user: dict = Depends(get_current
                     }
                 )
 
-    # Update stock for each item
+    all_allocated_items: List[PurchaseItem] = list(payload_items)
+    for split_record in split_purchase_records:
+        for raw_item in split_record.get("items", []):
+            all_allocated_items.append(PurchaseItem(**raw_item))
+
+    # Update stock for each allocated item (primary + split auto-purchases)
     computed_total_cost = 0.0
-    for item in payload_items:
+    for item in all_allocated_items:
         product = await db.products.find_one(
             {"id": item.product_id, "shop_id": user["shop_id"]}, {"_id": 0}
         )
